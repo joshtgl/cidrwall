@@ -150,25 +150,3 @@ atomic rename event classification, failed-stage retention, bounded population, 
 incompatible-layout rejection. The namespace test exercises nftables rules without touching the
 host ruleset. Building the default feature set also compiles and embeds the Aya eBPF object;
 `--no-default-features` remains available for a build with neither native netlink nor XDP.
-
-## Publishing
-
-All three crates use the same version and are published in dependency order:
-`cidrwall-common`, `cidrwall-ebpf`, then `cidrwall`. The eBPF crate is a source package used by
-`cidrwall`'s build script; its default target is a small host-verifiable library, while the actual
-BPF target is enabled only by the build script's `program` feature.
-
-The first crates.io publication must be made locally with a crates.io API token because trusted
-publishing cannot claim a package name that does not exist yet. The bootstrap uses normal Cargo
-verification, so install the same native libraries, nightly `rust-src`, and `bpf-linker` required
-by a default build. Commit the release version and run:
-
-```console
-./scripts/publish-initial.sh --execute
-```
-
-The script requires a clean tracked worktree, skips packages already published at that version,
-waits for each package to become visible in the crates.io index, and then publishes its dependent.
-Configure GitHub trusted publishing for all three crate names after this bootstrap. Subsequent
-releases are handled by release-plz as one version group; only `cidrwall` creates the Git tag and
-GitHub release.
