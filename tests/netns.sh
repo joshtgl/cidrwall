@@ -18,7 +18,38 @@ ROUTER="cidrwall-router-$$"
 WAN="cidrwall-wan-$$"
 LAN="cidrwall-lan-$$"
 PID=""
+fail() {
+    echo "namespace test failed: $*" >&2
+    exit 1
+}
+wait_for_log() {
+    log_file=$1
+    pattern=$2
+    description=$3
+    tries=0
+    until grep -q "$pattern" "$log_file"; do
+        if [ -n "$PID" ] && ! kill -0 "$PID" 2>/dev/null; then
+            cat "$log_file" >&2
+            fail "$description daemon exited before becoming ready"
+        fi
+        tries=$((tries + 1))
+        if [ "$tries" -gt 100 ]; then
+            cat "$log_file" >&2
+            fail "timed out waiting for $description"
+        fi
+        sleep 0.1
+    done
+}
 cleanup() {
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        for log_file in "$TMP"/*log; do
+            if [ -f "$log_file" ]; then
+                echo "--- $log_file ---" >&2
+                sed -n '1,240p' "$log_file" >&2
+            fi
+        done
+    fi
     if [ -n "$PID" ]; then kill -TERM "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; fi
     ip netns del "$ROUTER" 2>/dev/null || true
     ip netns del "$WAN" 2>/dev/null || true
@@ -100,27 +131,33 @@ EOF
 
 ip netns exec "$ROUTER" "$BIN" --config "$TMP/cidrwall.toml" >"$TMP/log" 2>&1 &
 PID=$!
-tries=0
-until ip netns exec "$ROUTER" nft list table inet cidrwall >"$TMP/ruleset" 2>/dev/null; do
-    tries=$((tries + 1))
-    if [ "$tries" -gt 50 ]; then cat "$TMP/log" >&2; exit 1; fi
-    sleep 0.1
-done
+wait_for_log "$TMP/log" 'activated blocklist generations: reason=startup' 'initial nftables startup'
+ip netns exec "$ROUTER" nft list table inet cidrwall >"$TMP/ruleset"
 
 # Input inbound: source 192.0.2.2 arriving on WAN.
-if ip netns exec "$WAN" ping -c 1 -W 1 192.0.2.1 >/dev/null 2>&1; then exit 1; fi
+if ip netns exec "$WAN" ping -c 1 -W 1 192.0.2.1 >/dev/null 2>&1; then
+    fail "nftables input rule did not block inbound traffic"
+fi
 # Forward inbound: source 192.0.2.2 from WAN to LAN.
-if ip netns exec "$WAN" ping -c 1 -W 1 10.0.0.2 >/dev/null 2>&1; then exit 1; fi
+if ip netns exec "$WAN" ping -c 1 -W 1 10.0.0.2 >/dev/null 2>&1; then
+    fail "nftables forward rule did not block inbound traffic"
+fi
 # Output outbound: destination 198.51.100.2 leaving WAN.
-if ip netns exec "$ROUTER" ping -c 1 -W 1 198.51.100.2 >/dev/null 2>&1; then exit 1; fi
+if ip netns exec "$ROUTER" ping -c 1 -W 1 198.51.100.2 >/dev/null 2>&1; then
+    fail "nftables output rule did not block outbound traffic"
+fi
 # Forward outbound: LAN to destination 198.51.100.2 on WAN.
-if ip netns exec "$LAN" ping -c 1 -W 1 198.51.100.2 >/dev/null 2>&1; then exit 1; fi
+if ip netns exec "$LAN" ping -c 1 -W 1 198.51.100.2 >/dev/null 2>&1; then
+    fail "nftables forward rule did not block outbound traffic"
+fi
 
 # An invalid atomic replacement must retain the active inbound set.
 printf '%s\n' '192.0.2.2/32' '192.0.2.4/32' 'not-a-cidr' >"$TMP/.inbound.tmp"
 mv "$TMP/.inbound.tmp" "$TMP/inbound.txt"
 sleep 1
-if ip netns exec "$WAN" ping -c 1 -W 1 192.0.2.1 >/dev/null 2>&1; then exit 1; fi
+if ip netns exec "$WAN" ping -c 1 -W 1 192.0.2.1 >/dev/null 2>&1; then
+    fail "invalid reload replaced the active inbound nftables generation"
+fi
 
 # A valid rename reloads inbound independently; outbound must remain blocked.
 printf '%s\n' '203.0.113.0/24' >"$TMP/.inbound.tmp"
@@ -128,10 +165,12 @@ mv "$TMP/.inbound.tmp" "$TMP/inbound.txt"
 tries=0
 until ip netns exec "$WAN" ping -c 1 -W 1 192.0.2.1 >/dev/null 2>&1; do
     tries=$((tries + 1))
-    if [ "$tries" -gt 30 ]; then cat "$TMP/log" >&2; exit 1; fi
+    if [ "$tries" -gt 30 ]; then cat "$TMP/log" >&2; fail "valid inbound nftables reload did not activate"; fi
     sleep 0.1
 done
-if ip netns exec "$ROUTER" ping -c 1 -W 1 198.51.100.2 >/dev/null 2>&1; then exit 1; fi
+if ip netns exec "$ROUTER" ping -c 1 -W 1 198.51.100.2 >/dev/null 2>&1; then
+    fail "inbound reload replaced the active outbound nftables generation"
+fi
 
 kill -TERM "$PID"
 wait "$PID"
@@ -154,13 +193,10 @@ ingress_zones = ["WAN"]
 EOF
 ip netns exec "$ROUTER" "$BIN" --config "$TMP/inbound-only.toml" >"$TMP/inbound-only-log" 2>&1 &
 PID=$!
-tries=0
-until ip netns exec "$ROUTER" nft list table inet cidrwall >/dev/null 2>&1; do
-    tries=$((tries + 1))
-    if [ "$tries" -gt 50 ]; then cat "$TMP/inbound-only-log" >&2; exit 1; fi
-    sleep 0.1
-done
-if ip netns exec "$WAN" ping -c 1 -W 1 192.0.2.1 >/dev/null 2>&1; then exit 1; fi
+wait_for_log "$TMP/inbound-only-log" 'activated blocklist generations: reason=startup' 'inbound-only nftables startup'
+if ip netns exec "$WAN" ping -c 1 -W 1 192.0.2.1 >/dev/null 2>&1; then
+    fail "inbound-only nftables rule did not block traffic"
+fi
 ip netns exec "$ROUTER" ping -c 1 -W 1 198.51.100.2 >/dev/null
 if ip netns exec "$ROUTER" nft list table inet cidrwall | grep -q 'set out_.*_g'; then
     echo "inbound-only configuration created outbound generation sets" >&2
@@ -207,23 +243,29 @@ egress_zones = ["WAN"]
 EOF
 ip netns exec "$ROUTER" "$BIN" --config "$TMP/xdp.toml" >"$TMP/xdp-log" 2>&1 &
 PID=$!
-tries=0
-until [ -e "$TMP/bpffs/cidrwall/links/$(ip -n "$ROUTER" -o link show wan0 | cut -d: -f1 | tr -d ' ')" ]; do
-    tries=$((tries + 1))
-    if [ "$tries" -gt 50 ]; then cat "$TMP/xdp-log" >&2; exit 1; fi
-    sleep 0.1
-done
-if ip netns exec "$WAN" ping -c 1 -W 1 192.0.2.1 >/dev/null 2>&1; then exit 1; fi
-if ip netns exec "$ROUTER" ping -c 1 -W 1 198.51.100.2 >/dev/null 2>&1; then exit 1; fi
+wait_for_log "$TMP/xdp-log" 'activated XDP blocklist: reason=startup' 'XDP startup'
+ifindex=$(ip -n "$ROUTER" -o link show wan0 | cut -d: -f1 | tr -d ' ')
+if [ ! -e "$TMP/bpffs/cidrwall/links/$ifindex" ]; then
+    cat "$TMP/xdp-log" >&2
+    fail "XDP link was not pinned for wan0"
+fi
+if ip netns exec "$WAN" ping -c 1 -W 1 192.0.2.1 >/dev/null 2>&1; then
+    fail "XDP did not block inbound traffic"
+fi
+if ip netns exec "$ROUTER" ping -c 1 -W 1 198.51.100.2 >/dev/null 2>&1; then
+    fail "nftables did not block outbound traffic in hybrid mode"
+fi
 printf '%s\n' '203.0.113.0/24' >"$TMP/.inbound.tmp"
 mv "$TMP/.inbound.tmp" "$TMP/inbound.txt"
 tries=0
 until ip netns exec "$WAN" ping -c 1 -W 1 192.0.2.1 >/dev/null 2>&1; do
     tries=$((tries + 1))
-    if [ "$tries" -gt 30 ]; then cat "$TMP/xdp-log" >&2; exit 1; fi
+    if [ "$tries" -gt 30 ]; then cat "$TMP/xdp-log" >&2; fail "valid XDP reload did not activate"; fi
     sleep 0.1
 done
-if ip netns exec "$ROUTER" ping -c 1 -W 1 198.51.100.2 >/dev/null 2>&1; then exit 1; fi
+if ip netns exec "$ROUTER" ping -c 1 -W 1 198.51.100.2 >/dev/null 2>&1; then
+    fail "XDP reload replaced the active outbound nftables generation"
+fi
 kill -TERM "$PID"
 wait "$PID"
 PID=""
