@@ -162,7 +162,7 @@ until ip netns exec "$ROUTER" nft list table inet cidrwall >/dev/null 2>&1; do
 done
 if ip netns exec "$WAN" ping -c 1 -W 1 192.0.2.1 >/dev/null 2>&1; then exit 1; fi
 ip netns exec "$ROUTER" ping -c 1 -W 1 198.51.100.2 >/dev/null
-if ip netns exec "$ROUTER" nft list sets inet cidrwall | grep -q 'out_.*_g'; then
+if ip netns exec "$ROUTER" nft list table inet cidrwall | grep -q 'set out_.*_g'; then
     echo "inbound-only configuration created outbound generation sets" >&2
     exit 1
 fi
