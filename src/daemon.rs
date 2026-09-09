@@ -1,3 +1,5 @@
+#[cfg(feature = "tc")]
+use crate::tc::TcManager;
 #[cfg(feature = "xdp")]
 use crate::xdp::XdpManager;
 use crate::{
@@ -33,6 +35,12 @@ pub struct Daemon<B> {
     xdp: Option<XdpManager>,
     #[cfg(feature = "xdp")]
     xdp_started: bool,
+    #[cfg(feature = "tc")]
+    tc: Option<TcManager>,
+    #[cfg(feature = "tc")]
+    tc_started: bool,
+    #[cfg(feature = "tc")]
+    tc_protected: BTreeSet<String>,
 }
 
 impl<B: Backend> Daemon<B> {
@@ -47,6 +55,12 @@ impl<B: Backend> Daemon<B> {
         if !rules.is_empty() {
             check_flowtables(&config, &mut backend, &protected)?;
         }
+        #[cfg(feature = "tc")]
+        let tc_protected = config.resolve_tc_interfaces(&zones)?;
+        #[cfg(feature = "tc")]
+        if !tc_protected.is_empty() {
+            check_tc_flowtables(&config, &mut backend, &tc_protected)?;
+        }
         #[cfg(feature = "xdp")]
         let xdp = if config.xdp.rules.is_empty() {
             None
@@ -60,6 +74,16 @@ impl<B: Backend> Daemon<B> {
         if !config.xdp.rules.is_empty() {
             bail!("XDP rules were configured, but this cidrwall build has no XDP support");
         }
+        #[cfg(feature = "tc")]
+        let tc = if config.tc.rules.is_empty() {
+            None
+        } else {
+            Some(TcManager::new(&config, tc_protected.clone())?)
+        };
+        #[cfg(not(feature = "tc"))]
+        if !config.tc.rules.is_empty() {
+            bail!("TC rules were configured, but this cidrwall build has no TC support");
+        }
         Ok(Self {
             config,
             rules,
@@ -71,6 +95,12 @@ impl<B: Backend> Daemon<B> {
             xdp,
             #[cfg(feature = "xdp")]
             xdp_started: false,
+            #[cfg(feature = "tc")]
+            tc,
+            #[cfg(feature = "tc")]
+            tc_started: false,
+            #[cfg(feature = "tc")]
+            tc_protected,
         })
     }
 
@@ -84,6 +114,14 @@ impl<B: Backend> Daemon<B> {
             && let Err(error) = xdp.cleanup()
         {
             cleanup_errors.push(anyhow::anyhow!("XDP cleanup failed: {error:#}"));
+        }
+        #[cfg(feature = "tc")]
+        if self.tc_started
+            && self.config.tc.cleanup_on_exit
+            && let Some(tc) = self.tc.take()
+            && let Err(error) = tc.cleanup()
+        {
+            cleanup_errors.push(anyhow::anyhow!("TC cleanup failed: {error:#}"));
         }
         if self.nft_started
             && self.config.nftables.cleanup_on_exit
@@ -125,6 +163,14 @@ impl<B: Backend> Daemon<B> {
             self.xdp_started = true;
             xdp.reload(&self.config, "startup")
                 .context("startup could not activate the XDP blocklist")?;
+        }
+        #[cfg(feature = "tc")]
+        if let Some(tc) = &mut self.tc {
+            tc.reload(&self.config, "startup")
+                .context("startup could not activate the TC blocklist")?;
+            tc.activate()
+                .context("startup could not attach the TCX egress program")?;
+            self.tc_started = true;
         }
         Ok(())
     }
@@ -472,6 +518,14 @@ impl<B: Backend> Daemon<B> {
         {
             errors.push(error.context("XDP reconciliation failed"));
         }
+        #[cfg(feature = "tc")]
+        if let Some(tc) = &mut self.tc
+            && let Err(error) =
+                check_tc_flowtables(&self.config, &mut self.backend, &self.tc_protected)
+                    .and_then(|()| tc.reconcile())
+        {
+            errors.push(error.context("TC reconciliation failed"));
+        }
         if errors.is_empty() {
             Ok(())
         } else {
@@ -496,6 +550,13 @@ impl<B: Backend> Daemon<B> {
         if direction == Direction::Inbound
             && let Some(xdp) = &mut self.xdp
             && let Err(error) = xdp.reload(&self.config, reason)
+        {
+            errors.push(error);
+        }
+        #[cfg(feature = "tc")]
+        if direction == Direction::Outbound
+            && let Some(tc) = &mut self.tc
+            && let Err(error) = tc.reload(&self.config, reason)
         {
             errors.push(error);
         }
@@ -576,6 +637,24 @@ fn check_flowtables<B: Backend>(
     Ok(())
 }
 
+#[cfg(feature = "tc")]
+fn check_tc_flowtables<B: Backend>(
+    config: &Config,
+    backend: &mut B,
+    protected: &BTreeSet<String>,
+) -> Result<()> {
+    if config.tc.allow_hardware_flowtable_bypass {
+        return Ok(());
+    }
+    let conflicts = backend.hardware_flowtable_conflicts(protected).with_context(|| {
+        "TC hardware-flowtable safety check requires native-netlink support; set tc.allow_hardware_flowtable_bypass = true only when bypass is acceptable"
+    })?;
+    if !conflicts.is_empty() {
+        return Err(BackendError::HardwareFlowtableBypass(conflicts).into());
+    }
+    Ok(())
+}
+
 pub fn classify_event(
     event: &Event,
     inbound: Option<&Path>,
@@ -605,7 +684,7 @@ fn same_target(event_path: &Path, target: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::{
-        config::{Files, Nftables, RuleMapping, Rules, Runtime, Xdp},
+        config::{Files, Nftables, RuleMapping, Rules, Runtime, Tc, Xdp},
         netlink::test_backend::MemoryBackend,
     };
     use notify::{
@@ -625,6 +704,7 @@ mod tests {
             zones: None,
             nftables: Nftables::default(),
             xdp: Xdp::default(),
+            tc: Tc::default(),
             runtime: Runtime::default(),
             rules: Rules {
                 input: vec![RuleMapping {
@@ -664,6 +744,29 @@ mod tests {
             )
             .contains(&Direction::Inbound)
         );
+    }
+
+    #[cfg(feature = "tc")]
+    #[test]
+    fn rejects_only_hardware_flowtables_for_tc() {
+        let mut config = config(Path::new("/tmp"));
+        let protected = ["eth0".to_owned()].into_iter().collect();
+        let mut backend = MemoryBackend {
+            flowtable_interfaces: ["eth0".to_owned()].into_iter().collect(),
+            ..MemoryBackend::default()
+        };
+        check_tc_flowtables(&config, &mut backend, &protected).unwrap();
+
+        backend.hardware_flowtable_interfaces = ["eth0".to_owned()].into_iter().collect();
+        assert!(
+            check_tc_flowtables(&config, &mut backend, &protected)
+                .unwrap_err()
+                .to_string()
+                .contains("hardware-offloaded")
+        );
+
+        config.tc.allow_hardware_flowtable_bypass = true;
+        check_tc_flowtables(&config, &mut backend, &protected).unwrap();
     }
 
     #[test]

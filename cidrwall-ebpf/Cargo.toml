@@ -3,12 +3,13 @@ name = "cidrwall-ebpf"
 version = "0.1.3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "XDP filtering program for cidrwall"
+description = "XDP and TCX filtering programs for cidrwall"
 repository = "https://github.com/joshtgl/cidrwall"
 
 [features]
 default = []
-program = ["dep:aya-ebpf", "dep:cidrwall-common"]
+xdp-program = ["dep:aya-ebpf", "dep:cidrwall-common"]
+tc-program = ["dep:aya-ebpf", "dep:cidrwall-common"]
 
 [dependencies]
 aya-ebpf = { version = "0.2.1", optional = true }
@@ -18,8 +19,15 @@ cidrwall-common = { version = "=0.1.3", path = "../cidrwall-common", optional = 
 path = "src/lib.rs"
 
 [[bin]]
-name = "cidrwall"
-path = "src/main.rs"
+name = "cidrwall-xdp"
+path = "src/xdp.rs"
 test = false
 bench = false
-required-features = ["program"]
+required-features = ["xdp-program"]
+
+[[bin]]
+name = "cidrwall-tc"
+path = "src/tc.rs"
+test = false
+bench = false
+required-features = ["tc-program"]

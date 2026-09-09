@@ -1,8 +1,8 @@
 use crate::{
     blocklist::{self, AddressPrefix},
-    config::{Config, Xdp as XdpConfig, XdpMode as ConfigMode, open_blocklist},
+    config::{Config, Direction, Tc as TcConfig, TcAttachOrder, open_blocklist},
 };
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use aya::{
     Ebpf, EbpfLoader,
     maps::{
@@ -10,8 +10,9 @@ use aya::{
         lpm_trie::{Key, LpmTrie},
     },
     programs::{
-        Xdp, XdpMode,
+        LinkOrder, SchedClassifier, TcAttachType,
         links::{FdLink, PinnedLink},
+        tc::TcAttachOptions,
     },
 };
 use cidrwall_common::{Control, LAYOUT_VERSION, SLOT_COUNT};
@@ -28,14 +29,15 @@ const IPV4_B: &str = "IPV4_B";
 const IPV6_A: &str = "IPV6_A";
 const IPV6_B: &str = "IPV6_B";
 const MAP_NAMES: [&str; 5] = [CONTROL, IPV4_A, IPV4_B, IPV6_A, IPV6_B];
-const PROGRAM: &str = "cidrwall";
-const OBJECT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cidrwall-xdp"));
+const PROGRAM: &str = "cidrwall_tc";
+const OBJECT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cidrwall-tc"));
 
 type V4Trie = LpmTrie<MapData, [u8; 4], u8>;
 type V6Trie = LpmTrie<MapData, [u8; 16], u8>;
 
-pub struct XdpManager {
-    config: XdpConfig,
+pub struct TcManager {
+    config: TcConfig,
+    interface_names: BTreeSet<String>,
     interfaces: BTreeMap<u32, String>,
     _ebpf: Ebpf,
     control: Array<MapData, Control>,
@@ -46,27 +48,27 @@ pub struct XdpManager {
     links: BTreeMap<u32, PinnedLink>,
 }
 
-impl XdpManager {
+impl TcManager {
     pub fn new(config: &Config, interface_names: BTreeSet<String>) -> Result<Self> {
-        let xdp = config.xdp.clone();
-        fs::create_dir_all(&xdp.pin_path)
-            .with_context(|| format!("create XDP pin directory {}", xdp.pin_path.display()))?;
-        fs::create_dir_all(link_dir(&xdp))
-            .with_context(|| format!("create XDP link directory {}", link_dir(&xdp).display()))?;
+        let tc = config.tc.clone();
+        fs::create_dir_all(&tc.pin_path)
+            .with_context(|| format!("create TC pin directory {}", tc.pin_path.display()))?;
+        fs::create_dir_all(link_dir(&tc))
+            .with_context(|| format!("create TC link directory {}", link_dir(&tc).display()))?;
 
-        let interfaces = resolve_interfaces(interface_names)?;
+        let interfaces = resolve_interfaces(&interface_names)?;
         let mut loader = EbpfLoader::new();
         loader
-            .default_map_pin_directory(&xdp.pin_path)
-            .map_max_entries(IPV4_A, xdp.ipv4_max_entries)
-            .map_max_entries(IPV4_B, xdp.ipv4_max_entries)
-            .map_max_entries(IPV6_A, xdp.ipv6_max_entries)
-            .map_max_entries(IPV6_B, xdp.ipv6_max_entries);
-        let mut ebpf = loader.load(OBJECT).context("load cidrwall XDP object")?;
+            .default_map_pin_directory(&tc.pin_path)
+            .map_max_entries(IPV4_A, tc.ipv4_max_entries)
+            .map_max_entries(IPV4_B, tc.ipv4_max_entries)
+            .map_max_entries(IPV6_A, tc.ipv6_max_entries)
+            .map_max_entries(IPV6_B, tc.ipv6_max_entries);
+        let mut ebpf = loader.load(OBJECT).context("load cidrwall TC object")?;
 
         let mut control: Array<_, Control> = ebpf
             .take_map(CONTROL)
-            .context("XDP object has no CONTROL map")?
+            .context("TC object has no CONTROL map")?
             .try_into()?;
         let current = control.get(&0, 0)?;
         if current.layout_version == 0 {
@@ -80,8 +82,8 @@ impl XdpManager {
             )?;
         } else if current.layout_version != LAYOUT_VERSION || current.active_slot >= SLOT_COUNT {
             bail!(
-                "{} contains an incompatible XDP map layout (version={}, active_slot={})",
-                xdp.pin_path.display(),
+                "{} contains an incompatible TC map layout (version={}, active_slot={})",
+                tc.pin_path.display(),
                 current.layout_version,
                 current.active_slot
             );
@@ -91,16 +93,16 @@ impl XdpManager {
         let ipv4_b = take_v4(&mut ebpf, IPV4_B)?;
         let ipv6_a = take_v6(&mut ebpf, IPV6_A)?;
         let ipv6_b = take_v6(&mut ebpf, IPV6_B)?;
-        let links = open_owned_links(&xdp, interfaces.keys().copied().collect())?;
 
-        let program: &mut Xdp = ebpf
+        let program: &mut SchedClassifier = ebpf
             .program_mut(PROGRAM)
-            .context("XDP object has no cidrwall program")?
+            .context("TC object has no cidrwall_tc program")?
             .try_into()?;
-        program.load().context("load cidrwall XDP program")?;
+        program.load().context("load cidrwall TCX program")?;
 
-        let mut manager = Self {
-            config: xdp,
+        Ok(Self {
+            config: tc,
+            interface_names,
             interfaces,
             _ebpf: ebpf,
             control,
@@ -108,20 +110,21 @@ impl XdpManager {
             ipv4_b,
             ipv6_a,
             ipv6_b,
-            links,
-        };
-        manager.reconcile_links()?;
-        Ok(manager)
+            links: BTreeMap::new(),
+        })
+    }
+
+    pub fn activate(&mut self) -> Result<()> {
+        self.replace_startup_links()
     }
 
     pub fn reload(&mut self, config: &Config, reason: &str) -> Result<()> {
         let active = self.control.get(&0, 0)?.active_slot;
         let inactive = 1 - active;
         self.clear_slot(inactive)?;
-
         let path = config
-            .blocklist_path(crate::config::Direction::Inbound)
-            .context("inbound blocklist is not configured for XDP")?;
+            .blocklist_path(Direction::Outbound)
+            .context("outbound blocklist is not configured for TC")?;
         let reader = open_blocklist(path)?;
         let mut ipv4 = 0u64;
         let mut ipv6 = 0u64;
@@ -138,7 +141,7 @@ impl XdpManager {
                             } => {
                                 if ipv4 >= u64::from(self.config.ipv4_max_entries) {
                                     bail!(
-                                        "XDP IPv4 map capacity exceeded ({})",
+                                        "TC IPv4 map capacity exceeded ({})",
                                         self.config.ipv4_max_entries
                                     );
                                 }
@@ -155,7 +158,7 @@ impl XdpManager {
                             } => {
                                 if ipv6 >= u64::from(self.config.ipv6_max_entries) {
                                     bail!(
-                                        "XDP IPv6 map capacity exceeded ({})",
+                                        "TC IPv6 map capacity exceeded ({})",
                                         self.config.ipv6_max_entries
                                     );
                                 }
@@ -174,9 +177,9 @@ impl XdpManager {
         );
         if let Err(error) = result {
             if let Err(clear) = self.clear_slot(inactive) {
-                log::error!("failed to clear rejected XDP staging slot: {clear:#}");
+                log::error!("failed to clear rejected TC staging slot: {clear:#}");
             }
-            return Err(error).with_context(|| format!("stage XDP blocklist {}", path.display()));
+            return Err(error).with_context(|| format!("stage TC blocklist {}", path.display()));
         }
 
         self.control.set(
@@ -188,10 +191,10 @@ impl XdpManager {
             0,
         )?;
         if let Err(error) = self.clear_slot(active) {
-            log::error!("obsolete XDP slot cleanup deferred: {error:#}");
+            log::error!("obsolete TC slot cleanup deferred: {error:#}");
         }
         log::info!(
-            "activated XDP blocklist: reason={reason} path={} ipv4_prefixes={ipv4} ipv6_prefixes={ipv6} slot={inactive}",
+            "activated TC blocklist: reason={reason} path={} ipv4_prefixes={ipv4} ipv6_prefixes={ipv6} slot={inactive}",
             path.display()
         );
         Ok(())
@@ -200,21 +203,34 @@ impl XdpManager {
     pub fn reconcile(&mut self) -> Result<()> {
         let state = self.control.get(&0, 0)?;
         if state.layout_version != LAYOUT_VERSION || state.active_slot >= SLOT_COUNT {
-            bail!("XDP control map has an incompatible layout");
+            bail!("TC control map has an incompatible layout");
         }
-        self.reconcile_links()
+        let current = resolve_interfaces(&self.interface_names)?;
+        let obsolete: Vec<_> = self
+            .links
+            .keys()
+            .filter(|ifindex| !current.contains_key(ifindex))
+            .copied()
+            .collect();
+        for ifindex in obsolete {
+            if let Some(link) = self.links.remove(&ifindex) {
+                drop(link.unpin().context("unpin obsolete TCX link")?);
+            }
+        }
+        self.interfaces = current;
+        self.attach_missing_links()
     }
 
     pub fn cleanup(mut self) -> Result<()> {
         let pin_path = self.config.pin_path.clone();
         for (_, link) in std::mem::take(&mut self.links) {
-            drop(link.unpin().context("unpin XDP link")?);
+            drop(link.unpin().context("unpin TCX link")?);
         }
         drop(self);
         remove_map_pins(&pin_path)
     }
 
-    pub fn cleanup_pinned(config: &XdpConfig) -> Result<()> {
+    pub fn cleanup_pinned(config: &TcConfig) -> Result<()> {
         validate_pinned_layout(config)?;
         if link_dir(config).exists() {
             for entry in fs::read_dir(link_dir(config))? {
@@ -227,7 +243,49 @@ impl XdpManager {
         remove_map_pins(&config.pin_path)
     }
 
-    fn reconcile_links(&mut self) -> Result<()> {
+    fn replace_startup_links(&mut self) -> Result<()> {
+        let desired: BTreeSet<_> = self.interfaces.keys().copied().collect();
+        for entry in fs::read_dir(link_dir(&self.config))? {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Ok(ifindex) = name.parse::<u32>() else {
+                continue;
+            };
+            if !desired.contains(&ifindex) {
+                drop(PinnedLink::from_pin(&path)?.unpin()?);
+            }
+        }
+
+        for (ifindex, name) in self.interfaces.clone() {
+            let path = link_path(&self.config, ifindex);
+            let old = path
+                .exists()
+                .then(|| PinnedLink::from_pin(&path))
+                .transpose()?;
+            let new = self.attach_new(&name, ifindex)?;
+            if let Some(old) = old {
+                let old_fd = old.unpin().context("unpin replaced TCX link")?;
+                match new.pin(&path) {
+                    Ok(pinned) => {
+                        self.links.insert(ifindex, pinned);
+                        drop(old_fd);
+                    }
+                    Err(error) => {
+                        let _ = old_fd.pin(&path);
+                        return Err(error.into());
+                    }
+                }
+            } else {
+                self.links.insert(ifindex, new.pin(&path)?);
+            }
+            log::info!("attached TCX: interface={name} ifindex={ifindex}");
+        }
+        Ok(())
+    }
+
+    fn attach_missing_links(&mut self) -> Result<()> {
         let missing: Vec<_> = self
             .interfaces
             .iter()
@@ -236,57 +294,53 @@ impl XdpManager {
             .collect();
         let mut attached = Vec::new();
         for (ifindex, name) in missing {
-            let result = self.attach(&name, ifindex);
-            if let Err(error) = result {
-                for ifindex in attached {
-                    if let Some(link) = self.links.remove(&ifindex)
-                        && let Err(cleanup) = link.unpin()
-                    {
-                        log::error!("failed to roll back XDP link {ifindex}: {cleanup}");
-                    }
+            match self.attach_new(&name, ifindex) {
+                Ok(link) => {
+                    let pinned = link.pin(link_path(&self.config, ifindex))?;
+                    self.links.insert(ifindex, pinned);
+                    attached.push(ifindex);
+                    log::info!("attached TCX: interface={name} ifindex={ifindex}");
                 }
-                return Err(error)
-                    .with_context(|| format!("attach XDP to {name} (ifindex {ifindex})"));
+                Err(error) => {
+                    for ifindex in attached {
+                        if let Some(link) = self.links.remove(&ifindex)
+                            && let Err(cleanup) = link.unpin()
+                        {
+                            log::error!("failed to roll back TCX link {ifindex}: {cleanup}");
+                        }
+                    }
+                    return Err(error)
+                        .with_context(|| format!("attach TCX to {name} (ifindex {ifindex})"));
+                }
             }
-            attached.push(ifindex);
         }
         Ok(())
     }
 
-    fn attach(&mut self, name: &str, ifindex: u32) -> Result<()> {
-        let modes: &[XdpMode] = match self.config.mode {
-            ConfigMode::Auto => &[XdpMode::Driver, XdpMode::Skb],
-            ConfigMode::Native => &[XdpMode::Driver],
-            ConfigMode::Generic => &[XdpMode::Skb],
+    fn attach_new(&mut self, name: &str, ifindex: u32) -> Result<FdLink> {
+        let order = match self.config.attach_order {
+            TcAttachOrder::First => LinkOrder::first(),
+            TcAttachOrder::Last => LinkOrder::last(),
         };
-        let mut last = None;
-        for (position, mode) in modes.iter().copied().enumerate() {
-            let program: &mut Xdp = self
-                ._ebpf
-                .program_mut(PROGRAM)
-                .context("XDP object has no cidrwall program")?
-                .try_into()?;
-            match program.attach_to_if_index(ifindex, mode) {
-                Ok(id) => {
-                    let link = program.take_link(id)?;
-                    let fd_link: FdLink = link.try_into().map_err(|_| {
-                        anyhow!(
-                            "kernel used legacy XDP attachment, which cannot be pinned persistently"
-                        )
-                    })?;
-                    let pinned = fd_link.pin(link_path(&self.config, ifindex))?;
-                    self.links.insert(ifindex, pinned);
-                    log::info!("attached XDP: interface={name} ifindex={ifindex} mode={mode:?}");
-                    return Ok(());
-                }
-                Err(error) if position + 1 < modes.len() && unsupported_native(&error) => {
-                    log::warn!("native XDP unsupported on {name}; retrying generic mode: {error}");
-                    last = Some(error);
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(last.context("no XDP attachment mode succeeded")?.into())
+        let program: &mut SchedClassifier = self
+            ._ebpf
+            .program_mut(PROGRAM)
+            .context("TC object has no cidrwall_tc program")?
+            .try_into()?;
+        let id = program
+            .attach_with_options(
+                name,
+                TcAttachType::Egress,
+                TcAttachOptions::TcxOrder(order),
+            )
+            .with_context(|| {
+                format!(
+                    "attach TCX egress program to {name} (ifindex {ifindex}); TC requires Linux 6.6 or newer"
+                )
+            })?;
+        let link = program.take_link(id)?;
+        link.try_into()
+            .map_err(|_| anyhow::anyhow!("kernel did not create a pinnable TCX link"))
     }
 
     fn clear_slot(&mut self, slot: u32) -> Result<()> {
@@ -321,81 +375,41 @@ impl XdpManager {
 fn take_v4(ebpf: &mut Ebpf, name: &str) -> Result<V4Trie> {
     Ok(ebpf
         .take_map(name)
-        .with_context(|| format!("XDP object has no {name} map"))?
+        .with_context(|| format!("TC object has no {name} map"))?
         .try_into()?)
 }
 
 fn take_v6(ebpf: &mut Ebpf, name: &str) -> Result<V6Trie> {
     Ok(ebpf
         .take_map(name)
-        .with_context(|| format!("XDP object has no {name} map"))?
+        .with_context(|| format!("TC object has no {name} map"))?
         .try_into()?)
 }
 
-fn resolve_interfaces(names: BTreeSet<String>) -> Result<BTreeMap<u32, String>> {
+fn resolve_interfaces(names: &BTreeSet<String>) -> Result<BTreeMap<u32, String>> {
     let mut interfaces = BTreeMap::new();
     for name in names {
         if name.contains('/') || name == "." || name == ".." {
             bail!("invalid interface name {name:?}");
         }
-        let path = Path::new("/sys/class/net").join(&name).join("ifindex");
+        let path = Path::new("/sys/class/net").join(name).join("ifindex");
         let ifindex: u32 = fs::read_to_string(&path)
-            .with_context(|| format!("XDP interface {name:?} does not exist"))?
+            .with_context(|| format!("TC interface {name:?} does not exist"))?
             .trim()
             .parse()
             .with_context(|| format!("read interface index from {}", path.display()))?;
         if interfaces.insert(ifindex, name.clone()).is_some() {
-            bail!("multiple XDP interfaces resolved to ifindex {ifindex}");
+            bail!("multiple TC interfaces resolved to ifindex {ifindex}");
         }
     }
     Ok(interfaces)
 }
 
-fn open_owned_links(
-    config: &XdpConfig,
-    desired: BTreeSet<u32>,
-) -> Result<BTreeMap<u32, PinnedLink>> {
-    let mut links = BTreeMap::new();
-    for entry in fs::read_dir(link_dir(config))? {
-        let path = entry?.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let Ok(ifindex) = name.parse::<u32>() else {
-            continue;
-        };
-        let link = PinnedLink::from_pin(&path)
-            .with_context(|| format!("open owned XDP link {}", path.display()))?;
-        if desired.contains(&ifindex) {
-            links.insert(ifindex, link);
-        } else {
-            drop(
-                link.unpin()
-                    .with_context(|| format!("remove obsolete XDP link {}", path.display()))?,
-            );
-        }
-    }
-    Ok(links)
-}
-
-fn unsupported_native(error: &aya::programs::ProgramError) -> bool {
-    let mut source: &(dyn std::error::Error + 'static) = error;
-    loop {
-        if let Some(io) = source.downcast_ref::<std::io::Error>() {
-            return matches!(io.raw_os_error(), Some(22 | 45 | 95));
-        }
-        let Some(next) = source.source() else {
-            return false;
-        };
-        source = next;
-    }
-}
-
-fn validate_pinned_layout(config: &XdpConfig) -> Result<()> {
+fn validate_pinned_layout(config: &TcConfig) -> Result<()> {
     let path = config.pin_path.join(CONTROL);
     if !path.exists() {
         bail!(
-            "no cidrwall XDP state exists at {}",
+            "no cidrwall TC state exists at {}",
             config.pin_path.display()
         );
     }
@@ -404,7 +418,7 @@ fn validate_pinned_layout(config: &XdpConfig) -> Result<()> {
     let state = control.get(&0, 0)?;
     if state.layout_version != LAYOUT_VERSION || state.active_slot >= SLOT_COUNT {
         bail!(
-            "refusing to clean an incompatible XDP layout at {}",
+            "refusing to clean an incompatible TC layout at {}",
             config.pin_path.display()
         );
     }
@@ -416,25 +430,25 @@ fn remove_map_pins(pin_path: &Path) -> Result<()> {
         let path = pin_path.join(name);
         if path.exists() {
             fs::remove_file(&path)
-                .with_context(|| format!("remove XDP map pin {}", path.display()))?;
+                .with_context(|| format!("remove TC map pin {}", path.display()))?;
         }
     }
     let links = pin_path.join("links");
     if links.exists() {
         fs::remove_dir(&links)
-            .with_context(|| format!("remove XDP link directory {}", links.display()))?;
+            .with_context(|| format!("remove TC link directory {}", links.display()))?;
     }
     if pin_path.exists() {
         fs::remove_dir(pin_path)
-            .with_context(|| format!("remove XDP pin directory {}", pin_path.display()))?;
+            .with_context(|| format!("remove TC pin directory {}", pin_path.display()))?;
     }
     Ok(())
 }
 
-fn link_dir(config: &XdpConfig) -> PathBuf {
+fn link_dir(config: &TcConfig) -> PathBuf {
     config.pin_path.join("links")
 }
 
-fn link_path(config: &XdpConfig, ifindex: u32) -> PathBuf {
+fn link_path(config: &TcConfig, ifindex: u32) -> PathBuf {
     link_dir(config).join(ifindex.to_string())
 }

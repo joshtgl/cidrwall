@@ -75,6 +75,8 @@ pub enum BackendError {
     Disabled,
     #[error("flowtable offload uses protected interface(s): {0:?}")]
     FlowtableBypass(BTreeSet<String>),
+    #[error("hardware-offloaded flowtable uses TC-protected interface(s): {0:?}")]
+    HardwareFlowtableBypass(BTreeSet<String>),
     #[error("invalid kernel object name: {0}")]
     InvalidName(String),
     #[error("refusing to remove an incompatible cidrwall layout")]
@@ -127,6 +129,10 @@ pub trait Backend {
         active: &ActiveGenerations,
     ) -> Result<(), BackendError>;
     fn flowtable_conflicts(
+        &mut self,
+        protected: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>, BackendError>;
+    fn hardware_flowtable_conflicts(
         &mut self,
         protected: &BTreeSet<String>,
     ) -> Result<BTreeSet<String>, BackendError>;
@@ -213,6 +219,12 @@ impl Backend for NftnlBackend {
         Err(BackendError::Disabled)
     }
     fn flowtable_conflicts(
+        &mut self,
+        _: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>, BackendError> {
+        Err(BackendError::Disabled)
+    }
+    fn hardware_flowtable_conflicts(
         &mut self,
         _: &BTreeSet<String>,
     ) -> Result<BTreeSet<String>, BackendError> {
@@ -506,7 +518,14 @@ mod native {
             &mut self,
             protected: &BTreeSet<String>,
         ) -> Result<BTreeSet<String>, BackendError> {
-            flowtable_conflicts(protected).map_err(Into::into)
+            flowtable_conflicts(protected, false).map_err(Into::into)
+        }
+
+        fn hardware_flowtable_conflicts(
+            &mut self,
+            protected: &BTreeSet<String>,
+        ) -> Result<BTreeSet<String>, BackendError> {
+            flowtable_conflicts(protected, true).map_err(Into::into)
         }
     }
 
@@ -819,16 +838,28 @@ mod native {
         }
     }
 
-    fn flowtable_conflicts(protected: &BTreeSet<String>) -> io::Result<BTreeSet<String>> {
+    fn flowtable_conflicts(
+        protected: &BTreeSet<String>,
+        hardware_only: bool,
+    ) -> io::Result<BTreeSet<String>> {
         #[derive(Default)]
         struct State {
             devices: BTreeSet<String>,
+            hardware_only: bool,
             error: Option<io::Error>,
         }
         fn collect(message: &libc::nlmsghdr, state: &mut State) -> libc::c_int {
-            match Flowtable::parse(message).and_then(|value| value.device_names()) {
-                Ok(values) => {
-                    state.devices.extend(values);
+            match Flowtable::parse(message) {
+                Ok(value) => {
+                    if !state.hardware_only || value.hardware_offload() {
+                        match value.device_names() {
+                            Ok(values) => state.devices.extend(values),
+                            Err(error) => {
+                                state.error = Some(error);
+                                return mnl::mnl_sys::MNL_CB_ERROR;
+                            }
+                        }
+                    }
                     mnl::mnl_sys::MNL_CB_OK
                 }
                 Err(error) => {
@@ -842,7 +873,10 @@ mod native {
         let portid = socket.portid();
         socket.send(request.as_bytes())?;
         let mut buffer = AlignedNetlinkBuffer::new(nftnl::nft_nlmsg_maxsize() as usize);
-        let mut state = State::default();
+        let mut state = State {
+            hardware_only,
+            ..State::default()
+        };
         loop {
             let len = socket.recv_raw(buffer.as_bytes_mut())?;
             let result = mnl::cb_run2(buffer.prefix(len)?, 1, portid, collect, &mut state);
@@ -959,6 +993,8 @@ pub mod test_backend {
         pub repairs: usize,
         pub activations: Vec<Direction>,
         pub cleanups: Vec<ActiveGenerations>,
+        pub flowtable_interfaces: BTreeSet<String>,
+        pub hardware_flowtable_interfaces: BTreeSet<String>,
     }
     impl Backend for MemoryBackend {
         fn cleanup(&mut self, _: &Config) -> Result<(), BackendError> {
@@ -1057,9 +1093,23 @@ pub mod test_backend {
         }
         fn flowtable_conflicts(
             &mut self,
-            _: &BTreeSet<String>,
+            protected: &BTreeSet<String>,
         ) -> Result<BTreeSet<String>, BackendError> {
-            Ok(BTreeSet::new())
+            Ok(self
+                .flowtable_interfaces
+                .intersection(protected)
+                .cloned()
+                .collect())
+        }
+        fn hardware_flowtable_conflicts(
+            &mut self,
+            protected: &BTreeSet<String>,
+        ) -> Result<BTreeSet<String>, BackendError> {
+            Ok(self
+                .hardware_flowtable_interfaces
+                .intersection(protected)
+                .cloned()
+                .collect())
         }
     }
 }

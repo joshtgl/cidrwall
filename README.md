@@ -1,19 +1,20 @@
 # cidrwall
 
 `cidrwall` watches Blockmerge's newline-delimited mixed IPv4/IPv6 CIDR files and enforces them with
-nftables, XDP, or both. nftables rules can cover input, forward, and output traffic. XDP rules drop
-packets by source address at ingress, before the network stack distinguishes local input from
-forwarded traffic. The daemon never invokes the `nft` executable.
+nftables, XDP, TCX, or a combination. nftables rules can cover input, forward, and output traffic.
+XDP drops packets by source address at ingress; TCX drops packets by destination address on selected
+egress interfaces. The daemon never invokes the `nft` or `tc` executable.
 
 Each backend stages updates independently and activates them atomically. nftables uses unreferenced
-generation sets; XDP uses two pinned LPM-trie slots and switches a control-map selector only after
-the inactive slot is complete. A parse, capacity, or kernel error leaves that backend's active
-generation unchanged and does not prevent the other backend from accepting a valid reload.
+generation sets; XDP and TCX use independent pairs of pinned LPM-trie slots and switch a control-map
+selector only after the inactive slot is complete. A parse, capacity, or kernel error leaves that
+backend's active generation unchanged and does not prevent another backend from accepting a valid
+reload.
 
 The nftables table contains separate interval sets for inbound/outbound IPv4/IPv6 traffic and base
-chains for input, forward, and output. XDP maps and links are pinned beneath
-`/sys/fs/bpf/cidrwall` by default. Normal SIGINT/SIGTERM shutdown preserves both backends unless
-cleanup is explicitly enabled.
+chains for input, forward, and output. XDP and TCX use separate pinned state beneath
+`/sys/fs/bpf/cidrwall` and `/sys/fs/bpf/cidrwall-tc` by default. Normal SIGINT/SIGTERM shutdown
+preserves every backend unless cleanup is explicitly enabled.
 
 ## Configuration
 
@@ -58,6 +59,38 @@ An XDP ingress interface may not also appear in an nftables inbound input/forwar
 because that commonly indicates accidental duplicate policy. Set
 `xdp.allow_nftables_overlap = true` when the overlap is intentional. nftables outbound mappings and
 inbound mappings on other interfaces remain available alongside XDP.
+
+TCX mappings accept only the outbound blocklist and apply equally to locally generated and forwarded
+IP traffic leaving the selected interfaces:
+
+```toml
+[tc]
+pin_path = "/sys/fs/bpf/cidrwall-tc"
+ipv4_max_entries = 5000000
+ipv6_max_entries = 5000000
+populate_batch_elements = 2000
+attach_order = "first"                 # first or last
+allow_nftables_overlap = false
+allow_hardware_flowtable_bypass = false
+cleanup_on_exit = false
+
+[[tc.rules]]
+blocklist = "outbound"
+egress_zones = ["WAN"]
+```
+
+TC requires Linux 6.6 or newer and uses TCX links directly; it does not create or own a `clsact`
+qdisc. Links and maps are pinned independently beneath `tc.pin_path`. `first` evaluates cidrwall
+before other TCX programs while allowing accepted packets to continue to them. `last` allows earlier
+programs to redirect or terminate processing first.
+
+Software nftables flowtables are compatible with TCX egress. Hardware-offloaded flowtables using a
+TC-protected interface are rejected because they can bypass TCX, unless
+`allow_hardware_flowtable_bypass = true` is explicitly set. Detecting hardware flowtables requires a
+build with `native-netlink`; without it, the same override is required to start TC.
+
+An interface may not also appear in an nftables outbound output/forward rule by default. Set
+`tc.allow_nftables_overlap = true` when duplicate enforcement is intentional.
 
 Unknown zones, interface-less non-local zones, local zones in forward rules, and chain-inappropriate
 fields are rejected before netlink is opened. Flowtables are queried directly over netlink. If one
@@ -108,12 +141,14 @@ known-good active generation. If startup cannot stage, verify, and activate both
 cidrwall exits nonzero instead of running without a tracked active generation; any pre-existing
 nftables table remains preserved for inspection.
 
-Set `cleanup_on_exit = true` independently in `[nftables]` and `[xdp]` to remove that backend's
-owned kernel state after SIGINT/SIGTERM or another orderly return. Both options default to false.
+Set `cleanup_on_exit = true` independently in `[nftables]`, `[xdp]`, and `[tc]` to remove that
+backend's owned kernel state after SIGINT/SIGTERM or another orderly return. All three options
+default to false.
 For one-shot administrative cleanup, use:
 
 ```console
 cidrwall --config ./config/cidrwall.toml --cleanup xdp
+cidrwall --config ./config/cidrwall.toml --cleanup tc
 cidrwall --config ./config/cidrwall.toml --cleanup nftables
 cidrwall --config ./config/cidrwall.toml --cleanup all
 ```
@@ -123,9 +158,9 @@ tables or pinned maps.
 
 ## Container
 
-The container needs the host network namespace, `CAP_NET_ADMIN`, and `CAP_BPF` for XDP on kernels
-that separate BPF privilege. It also needs the host bpffs mounted at `/sys/fs/bpf`. An nftables-only
-configuration needs only `CAP_NET_ADMIN`. Mount the Blockmerge output directory read-only so
+The container needs the host network namespace, `CAP_NET_ADMIN`, and `CAP_BPF` for XDP or TCX on
+kernels that separate BPF privilege. It also needs the host bpffs mounted at `/sys/fs/bpf`. An
+nftables-only configuration needs only `CAP_NET_ADMIN`. Mount the Blockmerge output directory read-only so
 inotify can observe destination renames.
 Both Debian and Alpine images install only the `libnftnl` and `libmnl` runtime libraries—`nft` is
 not installed. Build both variants with Docker Bake, or build either Dockerfile directly:
@@ -148,5 +183,6 @@ sudo ./tests/netns.sh
 The Rust suite covers parsing, interval/CIDR encoding, configuration rendering, overlap rejection,
 atomic rename event classification, failed-stage retention, bounded population, and
 incompatible-layout rejection. The namespace test exercises nftables rules without touching the
-host ruleset. Building the default feature set also compiles and embeds the Aya eBPF object;
-`--no-default-features` remains available for a build with neither native netlink nor XDP.
+host ruleset and exercises XDP and TCX in isolated interfaces. Building the default feature set also
+compiles and embeds both Aya eBPF objects; `--no-default-features` remains available for a build with
+neither native netlink nor eBPF support. `xdp` and `tc` can be enabled independently.

@@ -74,23 +74,35 @@ ip link set nb-lan netns "$LAN"
 ip -n "$ROUTER" addr add 192.0.2.1/24 dev wan0
 ip -n "$ROUTER" addr add 198.51.100.1/24 dev wan0
 ip -n "$ROUTER" addr add 10.0.0.1/24 dev lan0
+ip -n "$ROUTER" addr add 2001:db8:100::1/64 dev wan0 nodad
+ip -n "$ROUTER" addr add 2001:db8:200::1/64 dev wan0 nodad
+ip -n "$ROUTER" addr add fd00::1/64 dev lan0 nodad
 ip -n "$WAN" addr add 192.0.2.2/24 dev nb-wan
 ip -n "$WAN" addr add 198.51.100.2/24 dev nb-wan
+ip -n "$WAN" addr add 2001:db8:100::2/64 dev nb-wan nodad
+ip -n "$WAN" addr add 2001:db8:200::2/64 dev nb-wan nodad
 ip -n "$LAN" addr add 10.0.0.2/24 dev nb-lan
+ip -n "$LAN" addr add fd00::2/64 dev nb-lan nodad
 for spec in "$ROUTER wan0" "$ROUTER lan0" "$WAN nb-wan" "$LAN nb-lan"; do
     set -- $spec
     ip -n "$1" link set "$2" up
 done
 ip netns exec "$ROUTER" sysctl -q -w net.ipv4.ip_forward=1
+ip netns exec "$ROUTER" sysctl -q -w net.ipv6.conf.all.forwarding=1
 ip -n "$WAN" route add 10.0.0.0/24 via 192.0.2.1
+ip -n "$WAN" -6 route add fd00::/64 via 2001:db8:100::1
 ip -n "$LAN" route add 192.0.2.0/24 via 10.0.0.1
 ip -n "$LAN" route add 198.51.100.0/24 via 10.0.0.1
+ip -n "$LAN" -6 route add 2001:db8:100::/64 via fd00::1
+ip -n "$LAN" -6 route add 2001:db8:200::/64 via fd00::1
 
 # Prove the namespace topology before installing any filtering rules.
 ip netns exec "$WAN" ping -c 1 -W 1 192.0.2.1 >/dev/null
 ip netns exec "$WAN" ping -c 1 -W 1 10.0.0.2 >/dev/null
 ip netns exec "$ROUTER" ping -c 1 -W 1 198.51.100.2 >/dev/null
 ip netns exec "$LAN" ping -c 1 -W 1 198.51.100.2 >/dev/null
+ip netns exec "$ROUTER" ping -c 1 -W 1 2001:db8:200::2 >/dev/null
+ip netns exec "$LAN" ping -c 1 -W 1 2001:db8:200::2 >/dev/null
 
 cat >"$TMP/zones.json" <<'EOF'
 {"WAN":["wan0"],"LAN":["lan0"]}
@@ -276,6 +288,111 @@ fi
 ip netns exec "$ROUTER" nft list table inet cidrwall >/dev/null
 ip netns exec "$ROUTER" nft delete table inet cidrwall
 
+# TCX egress blocks both local and forwarded traffic and permits software flowtables.
+ip netns exec "$ROUTER" nft add table inet tcflow
+ip netns exec "$ROUTER" nft 'add flowtable inet tcflow fast { hook ingress priority 0; devices = { wan0 }; }'
+printf '%s\n' '198.51.100.2/32' '2001:db8:200::2/128' >"$TMP/outbound.txt"
+cat >"$TMP/tc.toml" <<EOF
+[files]
+zones = "$TMP/zones.json"
+outbound = "$TMP/outbound.txt"
+[tc]
+pin_path = "$TMP/bpffs/cidrwall-tc"
+ipv4_max_entries = 1024
+ipv6_max_entries = 1024
+populate_batch_elements = 2
+cleanup_on_exit = false
+[[tc.rules]]
+blocklist = "outbound"
+egress_zones = ["WAN"]
+EOF
+ip netns exec "$ROUTER" "$BIN" --config "$TMP/tc.toml" >"$TMP/tc-log" 2>&1 &
+PID=$!
+wait_for_log "$TMP/tc-log" 'activated TC blocklist: reason=startup' 'TC startup'
+ifindex=$(ip -n "$ROUTER" -o link show wan0 | cut -d: -f1 | tr -d ' ')
+if [ ! -e "$TMP/bpffs/cidrwall-tc/links/$ifindex" ]; then
+    fail "TCX link was not pinned for wan0"
+fi
+if ip netns exec "$ROUTER" ping -c 1 -W 1 198.51.100.2 >/dev/null 2>&1; then
+    fail "TCX did not block local outbound traffic"
+fi
+if ip netns exec "$LAN" ping -c 1 -W 1 198.51.100.2 >/dev/null 2>&1; then
+    fail "TCX did not block forwarded outbound traffic"
+fi
+if ip netns exec "$ROUTER" ping -c 1 -W 1 2001:db8:200::2 >/dev/null 2>&1; then
+    fail "TCX did not block local IPv6 outbound traffic"
+fi
+if ip netns exec "$LAN" ping -c 1 -W 1 2001:db8:200::2 >/dev/null 2>&1; then
+    fail "TCX did not block forwarded IPv6 outbound traffic"
+fi
+ip netns exec "$ROUTER" ping -c 1 -W 1 192.0.2.2 >/dev/null
+
+# A rejected TC reload retains the active slot.
+printf '%s\n' '198.51.100.2/32' '2001:db8:200::2/128' 'not-a-cidr' >"$TMP/.outbound.tmp"
+mv "$TMP/.outbound.tmp" "$TMP/outbound.txt"
+sleep 1
+if ip netns exec "$ROUTER" ping -c 1 -W 1 198.51.100.2 >/dev/null 2>&1; then
+    fail "invalid reload replaced the active TC generation"
+fi
+
+# A valid TC reload changes the destination atomically.
+printf '%s\n' '192.0.2.2/32' '2001:db8:100::2/128' >"$TMP/.outbound.tmp"
+mv "$TMP/.outbound.tmp" "$TMP/outbound.txt"
+tries=0
+until ip netns exec "$ROUTER" ping -c 1 -W 1 198.51.100.2 >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    if [ "$tries" -gt 30 ]; then cat "$TMP/tc-log" >&2; fail "valid TC reload did not activate"; fi
+    sleep 0.1
+done
+if ip netns exec "$ROUTER" ping -c 1 -W 1 192.0.2.2 >/dev/null 2>&1; then
+    fail "valid TC reload did not block the replacement destination"
+fi
+if ip netns exec "$ROUTER" ping -c 1 -W 1 2001:db8:100::2 >/dev/null 2>&1; then
+    fail "valid TC reload did not block the replacement IPv6 destination"
+fi
+
+# Pinned TCX state survives daemon shutdown and is adopted on restart.
+kill -TERM "$PID"
+wait "$PID"
+PID=""
+if ip netns exec "$ROUTER" ping -c 1 -W 1 192.0.2.2 >/dev/null 2>&1; then
+    fail "TCX enforcement did not survive daemon shutdown"
+fi
+ip netns exec "$ROUTER" "$BIN" --config "$TMP/tc.toml" >"$TMP/tc-restart-log" 2>&1 &
+PID=$!
+wait_for_log "$TMP/tc-restart-log" 'attached TCX:' 'TC restart'
+if ip netns exec "$ROUTER" ping -c 1 -W 1 192.0.2.2 >/dev/null 2>&1; then
+    fail "TCX enforcement was lost during restart"
+fi
+kill -TERM "$PID"
+wait "$PID"
+PID=""
+ip netns exec "$ROUTER" "$BIN" --config "$TMP/tc.toml" --cleanup tc
+if [ -e "$TMP/bpffs/cidrwall-tc" ]; then
+    fail "TC cleanup left pinned state behind"
+fi
+ip netns exec "$ROUTER" ping -c 1 -W 1 192.0.2.2 >/dev/null
+ip netns exec "$ROUTER" nft delete table inet tcflow
+
+# Hardware flowtable declarations fail TC startup unless explicitly allowed.
+ip netns exec "$ROUTER" nft add table inet tchardware
+if ip netns exec "$ROUTER" nft 'add flowtable inet tchardware fast { hook ingress priority 0; devices = { wan0 }; flags offload; }' 2>/dev/null; then
+    if ip netns exec "$ROUTER" "$BIN" --config "$TMP/tc.toml" >"$TMP/tc-hardware-log" 2>&1; then
+        fail "TC accepted a hardware-offloaded flowtable without an override"
+    fi
+    grep -q 'hardware-offloaded flowtable uses TC-protected interface' "$TMP/tc-hardware-log"
+    sed 's/cleanup_on_exit = false/cleanup_on_exit = true\nallow_hardware_flowtable_bypass = true/' "$TMP/tc.toml" >"$TMP/tc-hardware-allowed.toml"
+    ip netns exec "$ROUTER" "$BIN" --config "$TMP/tc-hardware-allowed.toml" >"$TMP/tc-hardware-allowed-log" 2>&1 &
+    PID=$!
+    wait_for_log "$TMP/tc-hardware-allowed-log" 'attached TCX:' 'hardware-flowtable override startup'
+    kill -TERM "$PID"
+    wait "$PID"
+    PID=""
+else
+    echo "hardware flowtable integration check skipped: veth does not support offload"
+fi
+ip netns exec "$ROUTER" nft delete table inet tchardware
+
 # A protected flowtable must make startup fail closed.
 ip netns exec "$ROUTER" nft add table inet flowtest
 ip netns exec "$ROUTER" nft 'add flowtable inet flowtest fast { hook ingress priority 0; devices = { wan0 }; }'
@@ -284,4 +401,4 @@ if ip netns exec "$ROUTER" "$BIN" --config "$TMP/cidrwall.toml" >"$TMP/flowtable
     exit 1
 fi
 grep -q 'flowtable offload uses protected interface' "$TMP/flowtable-log"
-echo "native nftables and XDP enforcement verified"
+echo "native nftables, XDP, and TCX enforcement verified"

@@ -48,6 +48,7 @@ pub struct Cli {
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum CleanupTarget {
     Xdp,
+    Tc,
     Nftables,
     All,
 }
@@ -63,6 +64,8 @@ pub struct Config {
     pub nftables: Nftables,
     #[serde(default)]
     pub xdp: Xdp,
+    #[serde(default)]
+    pub tc: Tc,
     #[serde(default)]
     pub runtime: Runtime,
     #[serde(default)]
@@ -145,6 +148,51 @@ pub enum XdpMode {
 pub struct XdpRule {
     pub blocklist: Direction,
     pub ingress_zones: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Tc {
+    pub pin_path: PathBuf,
+    pub ipv4_max_entries: u32,
+    pub ipv6_max_entries: u32,
+    pub populate_batch_elements: u32,
+    pub attach_order: TcAttachOrder,
+    pub allow_nftables_overlap: bool,
+    pub allow_hardware_flowtable_bypass: bool,
+    pub cleanup_on_exit: bool,
+    pub rules: Vec<TcRule>,
+}
+
+impl Default for Tc {
+    fn default() -> Self {
+        Self {
+            pin_path: "/sys/fs/bpf/cidrwall-tc".into(),
+            ipv4_max_entries: 5_000_000,
+            ipv6_max_entries: 5_000_000,
+            populate_batch_elements: 2_000,
+            attach_order: TcAttachOrder::First,
+            allow_nftables_overlap: false,
+            allow_hardware_flowtable_bypass: false,
+            cleanup_on_exit: false,
+            rules: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TcAttachOrder {
+    #[default]
+    First,
+    Last,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TcRule {
+    pub blocklist: Direction,
+    pub egress_zones: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -253,6 +301,18 @@ impl Config {
         if self.xdp.pin_path.as_os_str().is_empty() || !self.xdp.pin_path.is_absolute() {
             bail!("xdp.pin_path must be an absolute path")
         }
+        if self.tc.ipv4_max_entries == 0
+            || self.tc.ipv6_max_entries == 0
+            || self.tc.populate_batch_elements == 0
+        {
+            bail!("TC map capacities and population size must be non-zero")
+        }
+        if self.tc.pin_path.as_os_str().is_empty() || !self.tc.pin_path.is_absolute() {
+            bail!("tc.pin_path must be an absolute path")
+        }
+        if self.tc.pin_path == self.xdp.pin_path {
+            bail!("tc.pin_path and xdp.pin_path must be different")
+        }
         if cleanup {
             return Ok(());
         }
@@ -260,6 +320,7 @@ impl Config {
             && self.rules.forward.is_empty()
             && self.rules.output.is_empty()
             && self.xdp.rules.is_empty()
+            && self.tc.rules.is_empty()
         {
             bail!("at least one rule mapping is required")
         }
@@ -269,6 +330,14 @@ impl Config {
             }
             if rule.ingress_zones.is_empty() {
                 bail!("XDP rules require at least one ingress zone")
+            }
+        }
+        for rule in &self.tc.rules {
+            if rule.blocklist != Direction::Outbound {
+                bail!("TC rules only support the outbound blocklist")
+            }
+            if rule.egress_zones.is_empty() {
+                bail!("TC rules require at least one egress zone")
             }
         }
         for direction in [Direction::Inbound, Direction::Outbound] {
@@ -311,6 +380,29 @@ impl Config {
                 }
             }
         }
+        let tc_interfaces = self.resolve_tc_interfaces(&zones)?;
+        if !self.tc.rules.is_empty() && tc_interfaces.is_empty() {
+            bail!("TC rules must resolve to at least one egress interface")
+        }
+        if !self.tc.allow_nftables_overlap && !tc_interfaces.is_empty() {
+            for rule in self.resolve_rules(&zones)? {
+                if rule.blocklist != Direction::Outbound
+                    || !matches!(
+                        rule.chain,
+                        crate::zones::Chain::Output | crate::zones::Chain::Forward
+                    )
+                {
+                    continue;
+                }
+                if rule.egress.is_empty()
+                    || rule.egress.iter().any(|name| tc_interfaces.contains(name))
+                {
+                    bail!(
+                        "TC and nftables outbound rules overlap on a resolved egress interface; set tc.allow_nftables_overlap = true to allow this"
+                    )
+                }
+            }
+        }
         Ok(())
     }
 
@@ -337,6 +429,7 @@ impl Config {
                 .rules
                 .iter()
                 .any(|rule| rule.blocklist == direction)
+            || self.tc.rules.iter().any(|rule| rule.blocklist == direction)
     }
 
     pub fn uses_nftables(&self, direction: Direction) -> bool {
@@ -355,6 +448,17 @@ impl Config {
         let mut interfaces = std::collections::BTreeSet::new();
         for rule in &self.xdp.rules {
             interfaces.extend(zones.interfaces(&rule.ingress_zones)?);
+        }
+        Ok(interfaces)
+    }
+
+    pub fn resolve_tc_interfaces(
+        &self,
+        zones: &Zones,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let mut interfaces = std::collections::BTreeSet::new();
+        for rule in &self.tc.rules {
+            interfaces.extend(zones.interfaces(&rule.egress_zones)?);
         }
         Ok(interfaces)
     }
@@ -538,5 +642,109 @@ egress_zones = ["WAN"]
         let allowed = text.replace("[zones]", "[xdp]\nallow_nftables_overlap = true\n\n[zones]");
         let config: Config = toml::from_str(&allowed).unwrap();
         config.validate(false).unwrap();
+    }
+
+    #[test]
+    fn accepts_tc_outbound_rules_and_deduplicates_interfaces() {
+        let text = r#"
+[files]
+outbound = "/data/outbound.txt"
+[zones]
+WAN = ["eth0", "eth1"]
+BACKUP = ["eth1"]
+[tc]
+attach_order = "last"
+[[tc.rules]]
+blocklist = "outbound"
+egress_zones = ["WAN", "BACKUP"]
+"#;
+        let config: Config = toml::from_str(text).unwrap();
+        config.validate(false).unwrap();
+        assert_eq!(config.tc.attach_order, TcAttachOrder::Last);
+        assert_eq!(
+            config
+                .resolve_tc_interfaces(&config.load_zones().unwrap())
+                .unwrap(),
+            ["eth0".to_owned(), "eth1".to_owned()].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn rejects_tc_inbound_and_empty_egress_rules() {
+        let inbound = INLINE_CONFIG
+            .replace("[[rules.input]]", "[[tc.rules]]")
+            .replace("ingress_zones", "egress_zones");
+        let config: Config = toml::from_str(&inbound).unwrap();
+        assert!(
+            config
+                .validate(false)
+                .unwrap_err()
+                .to_string()
+                .contains("only support the outbound")
+        );
+
+        let empty = r#"
+[files]
+outbound = "/data/outbound.txt"
+[zones]
+WAN = ["eth0"]
+[tc]
+[[tc.rules]]
+blocklist = "outbound"
+egress_zones = []
+"#;
+        let config: Config = toml::from_str(empty).unwrap();
+        assert!(
+            config
+                .validate(false)
+                .unwrap_err()
+                .to_string()
+                .contains("at least one egress zone")
+        );
+    }
+
+    #[test]
+    fn rejects_accidental_tc_nftables_overlap() {
+        let text = r#"
+[files]
+outbound = "/data/outbound.txt"
+[zones]
+WAN = ["eth0"]
+[tc]
+[[tc.rules]]
+blocklist = "outbound"
+egress_zones = ["WAN"]
+[[rules.output]]
+blocklist = "outbound"
+egress_zones = ["WAN"]
+"#;
+        let config: Config = toml::from_str(text).unwrap();
+        assert!(
+            config
+                .validate(false)
+                .unwrap_err()
+                .to_string()
+                .contains("overlap")
+        );
+
+        let allowed = text.replace("[tc]", "[tc]\nallow_nftables_overlap = true");
+        let config: Config = toml::from_str(&allowed).unwrap();
+        config.validate(false).unwrap();
+    }
+
+    #[test]
+    fn rejects_shared_xdp_and_tc_pin_paths() {
+        let text = INLINE_CONFIG.replace(
+            "[zones]",
+            "[tc]\npin_path = \"/sys/fs/bpf/cidrwall\"\n\n[zones]",
+        );
+        let config: Config = toml::from_str(&text).unwrap();
+        assert!(
+            config
+                .validate(false)
+                .unwrap_err()
+                .to_string()
+                .contains("must be different")
+        );
     }
 }

@@ -27,6 +27,16 @@ populate_batch_elements = 2000
 allow_nftables_overlap = false
 cleanup_on_exit = false
 
+[tc]
+pin_path = "/sys/fs/bpf/cidrwall-tc"
+ipv4_max_entries = 5000000
+ipv6_max_entries = 5000000
+populate_batch_elements = 2000
+attach_order = "first"
+allow_nftables_overlap = false
+allow_hardware_flowtable_bypass = false
+cleanup_on_exit = false
+
 [runtime]
 debounce_ms = 500
 reconcile_secs = 60
@@ -35,11 +45,6 @@ reconcile_secs = 60
 blocklist = "inbound"
 ingress_zones = ["WAN"]
 
-[[rules.output]]
+[[tc.rules]]
 blocklist = "outbound"
-egress_zones = ["WAN"]
-
-[[rules.forward]]
-blocklist = "outbound"
-ingress_zones = ["LAN", "GUEST", "VPN1", "VPN2"]
 egress_zones = ["WAN"]

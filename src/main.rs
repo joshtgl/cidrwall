@@ -14,6 +14,7 @@ fn main() -> Result<()> {
     if let Some(target) = cli.cleanup {
         let cleanup_nft = matches!(target, CleanupTarget::Nftables | CleanupTarget::All);
         let cleanup_xdp = matches!(target, CleanupTarget::Xdp | CleanupTarget::All);
+        let cleanup_tc = matches!(target, CleanupTarget::Tc | CleanupTarget::All);
         let mut errors = Vec::new();
         if cleanup_xdp {
             #[cfg(feature = "xdp")]
@@ -23,6 +24,16 @@ fn main() -> Result<()> {
             #[cfg(not(feature = "xdp"))]
             errors.push(anyhow::anyhow!(
                 "this cidrwall build has no XDP cleanup support"
+            ));
+        }
+        if cleanup_tc {
+            #[cfg(feature = "tc")]
+            if let Err(error) = cidrwall::tc::TcManager::cleanup_pinned(&config.tc) {
+                errors.push(anyhow::anyhow!("TC cleanup failed: {error:#}"));
+            }
+            #[cfg(not(feature = "tc"))]
+            errors.push(anyhow::anyhow!(
+                "this cidrwall build has no TC cleanup support"
             ));
         }
         if cleanup_nft && let Err(error) = NftnlBackend::new().cleanup(&config) {
@@ -37,6 +48,9 @@ fn main() -> Result<()> {
         }
         for interface in config.resolve_xdp_interfaces(&zones)? {
             println!("xdp: blocklist=inbound ingress={interface}");
+        }
+        for interface in config.resolve_tc_interfaces(&zones)? {
+            println!("tc: blocklist=outbound egress={interface}");
         }
         return Ok(());
     }

@@ -27,6 +27,7 @@ use std::{
 const NFT_MSG_GETFLOWTABLE: u16 = 23;
 const NFT_MSG_GETTABLE: u16 = 1;
 const NFT_MSG_GETSET: u16 = 10;
+const NFT_FLOWTABLE_HW_OFFLOAD: u32 = 1;
 const MAX_FLOWTABLE_DEVICES: usize = 4096;
 
 /// Releases one kind of uniquely owned C allocation.
@@ -552,6 +553,25 @@ impl Flowtable {
             "flowtable device array is not terminated",
         ))
     }
+
+    pub(super) fn hardware_offload(&self) -> bool {
+        // SAFETY: The flowtable pointer remains valid and immutable for this call.
+        let is_set = unsafe {
+            sys::nftnl_flowtable_is_set(
+                self.0.pointer().as_ptr(),
+                sys::NFTNL_FLOWTABLE_FLAGS as u16,
+            )
+        };
+        is_set
+            // SAFETY: The flowtable is valid and the requested attribute was confirmed present.
+            && unsafe {
+                sys::nftnl_flowtable_get_u32(
+                    self.0.pointer().as_ptr(),
+                    sys::NFTNL_FLOWTABLE_FLAGS as u16,
+                ) & NFT_FLOWTABLE_HW_OFFLOAD
+                    != 0
+            }
+    }
 }
 
 /// Zeroed byte storage with alignment suitable for `nlmsghdr`.
@@ -1034,7 +1054,7 @@ mod tests {
         );
     }
 
-    fn build_flowtable_message(devices: Option<&[&CStr]>) -> NetlinkRequest {
+    fn build_flowtable_message(devices: Option<&[&CStr]>, flags: Option<u32>) -> NetlinkRequest {
         // SAFETY: Allocation has no preconditions.
         let source = unsafe { sys::nftnl_flowtable_alloc() };
         // SAFETY: A non-null result is uniquely owned and paired with `nftnl_flowtable_free`.
@@ -1072,6 +1092,16 @@ mod tests {
                 )
             };
             assert_eq!(result, 0);
+        }
+        if let Some(flags) = flags {
+            // SAFETY: The flowtable is live and libnftnl stores the scalar value.
+            unsafe {
+                sys::nftnl_flowtable_set_u32(
+                    source.pointer().as_ptr(),
+                    sys::NFTNL_FLOWTABLE_FLAGS as u16,
+                    flags,
+                )
+            };
         }
 
         let mut buffer = AlignedNetlinkBuffer::new(nftnl::nft_nlmsg_maxsize() as usize);
@@ -1570,11 +1600,11 @@ mod tests {
 
     #[test]
     fn flowtable_devices_round_trip_through_libnftnl() {
-        let message = build_flowtable_message(Some(&[c"wan0"]));
+        let message = build_flowtable_message(Some(&[c"wan0"]), None);
         let parsed = Flowtable::parse(header(message.as_bytes())).unwrap();
         assert_eq!(parsed.device_names().unwrap(), vec!["wan0"]);
 
-        let message = build_flowtable_message(Some(&[c"wan0", c"lan0", c"guest0"]));
+        let message = build_flowtable_message(Some(&[c"wan0", c"lan0", c"guest0"]), None);
         let parsed = Flowtable::parse(header(message.as_bytes())).unwrap();
         assert_eq!(
             parsed.device_names().unwrap(),
@@ -1584,7 +1614,7 @@ mod tests {
 
     #[test]
     fn flowtable_without_devices_fails_closed() {
-        let message = build_flowtable_message(None);
+        let message = build_flowtable_message(None, None);
         let parsed = Flowtable::parse(header(message.as_bytes())).unwrap();
         let error = parsed.device_names().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -1594,10 +1624,27 @@ mod tests {
     #[test]
     fn flowtable_with_invalid_utf8_device_fails_closed() {
         let invalid = c"wan\xff";
-        let message = build_flowtable_message(Some(&[invalid]));
+        let message = build_flowtable_message(Some(&[invalid]), None);
         let parsed = Flowtable::parse(header(message.as_bytes())).unwrap();
         let error = parsed.device_names().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("not UTF-8"));
+    }
+
+    #[test]
+    fn flowtable_hardware_offload_flag_round_trips() {
+        let software = build_flowtable_message(Some(&[c"wan0"]), None);
+        assert!(
+            !Flowtable::parse(header(software.as_bytes()))
+                .unwrap()
+                .hardware_offload()
+        );
+
+        let hardware = build_flowtable_message(Some(&[c"wan0"]), Some(1));
+        assert!(
+            Flowtable::parse(header(hardware.as_bytes()))
+                .unwrap()
+                .hardware_offload()
+        );
     }
 }
