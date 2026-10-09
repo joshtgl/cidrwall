@@ -21,7 +21,7 @@ ENV RUSTFLAGS="-C target-feature=-crt-static"
 
 RUN cargo build --locked --release --bin cidrwall
 
-FROM alpine:3.24.1
+FROM alpine:3.24.2
 
 RUN apk add --no-cache ca-certificates libgcc libmnl libnftnl
 
