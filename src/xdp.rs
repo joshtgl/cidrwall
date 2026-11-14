@@ -72,7 +72,7 @@ impl XdpManager {
         if current.layout_version == 0 {
             control.set(
                 0,
-                Control {
+                &Control {
                     layout_version: LAYOUT_VERSION,
                     active_slot: 0,
                 },
@@ -144,7 +144,7 @@ impl XdpManager {
                                 }
                                 self.v4_mut(inactive).insert(
                                     &Key::new(u32::from(prefix_len), address.octets()),
-                                    1,
+                                    &1,
                                     0,
                                 )?;
                                 ipv4 += 1;
@@ -161,7 +161,7 @@ impl XdpManager {
                                 }
                                 self.v6_mut(inactive).insert(
                                     &Key::new(u32::from(prefix_len), address.octets()),
-                                    1,
+                                    &1,
                                     0,
                                 )?;
                                 ipv6 += 1;
@@ -181,7 +181,7 @@ impl XdpManager {
 
         self.control.set(
             0,
-            Control {
+            &Control {
                 layout_version: LAYOUT_VERSION,
                 active_slot: inactive,
             },
@@ -266,7 +266,7 @@ impl XdpManager {
                 .program_mut(PROGRAM)
                 .context("XDP object has no cidrwall program")?
                 .try_into()?;
-            match program.attach_to_if_index(ifindex, mode) {
+            match program.attach(ifindex, mode) {
                 Ok(id) => {
                     let link = program.take_link(id)?;
                     let fd_link: FdLink = link.try_into().map_err(|_| {

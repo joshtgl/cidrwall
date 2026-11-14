@@ -10,9 +10,8 @@ use aya::{
         lpm_trie::{Key, LpmTrie},
     },
     programs::{
-        LinkOrder, SchedClassifier, TcAttachType,
+        LinkOrder, SchedClassifier, TcAttach, TcAttachType,
         links::{FdLink, PinnedLink},
-        tc::TcAttachOptions,
     },
 };
 use cidrwall_common::{Control, LAYOUT_VERSION, SLOT_COUNT};
@@ -74,7 +73,7 @@ impl TcManager {
         if current.layout_version == 0 {
             control.set(
                 0,
-                Control {
+                &Control {
                     layout_version: LAYOUT_VERSION,
                     active_slot: 0,
                 },
@@ -147,7 +146,7 @@ impl TcManager {
                                 }
                                 self.v4_mut(inactive).insert(
                                     &Key::new(u32::from(prefix_len), address.octets()),
-                                    1,
+                                    &1,
                                     0,
                                 )?;
                                 ipv4 += 1;
@@ -164,7 +163,7 @@ impl TcManager {
                                 }
                                 self.v6_mut(inactive).insert(
                                     &Key::new(u32::from(prefix_len), address.octets()),
-                                    1,
+                                    &1,
                                     0,
                                 )?;
                                 ipv6 += 1;
@@ -184,7 +183,7 @@ impl TcManager {
 
         self.control.set(
             0,
-            Control {
+            &Control {
                 layout_version: LAYOUT_VERSION,
                 active_slot: inactive,
             },
@@ -328,10 +327,12 @@ impl TcManager {
             .context("TC object has no cidrwall_tc program")?
             .try_into()?;
         let id = program
-            .attach_with_options(
-                name,
-                TcAttachType::Egress,
-                TcAttachOptions::TcxOrder(order),
+            .attach(
+                ifindex,
+                TcAttach::Tcx {
+                    attach_type: TcAttachType::Egress,
+                    order,
+                },
             )
             .with_context(|| {
                 format!(
