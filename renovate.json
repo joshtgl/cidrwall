@@ -9,6 +9,12 @@
   "rangeStrategy": "bump",
   "dependencyDashboard": true,
   "prConcurrentLimit": 5,
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": [
+      "before 6am on monday"
+    ]
+  },
   "customManagers": [
     {
       "customType": "regex",
@@ -31,6 +37,17 @@
       ],
       "depNameTemplate": "cargo-cyclonedx",
       "datasourceTemplate": "crate"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github\\/workflows\\/ci\\.yml$/"
+      ],
+      "matchStrings": [
+        "cargo install cargo-deny --version (?<currentValue>\\S+) --locked"
+      ],
+      "depNameTemplate": "cargo-deny",
+      "datasourceTemplate": "crate"
     }
   ],
   "packageRules": [
@@ -38,7 +55,10 @@
       "matchManagers": [
         "cargo"
       ],
-      "groupName": "rust dependencies"
+      "groupName": "rust dependencies",
+      "matchUpdateTypes": [
+        "!lockFileMaintenance"
+      ]
     },
     {
       "matchManagers": [
