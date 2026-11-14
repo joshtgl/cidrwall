@@ -1,6 +1,10 @@
 use anyhow::{Context as _, anyhow};
 use aya_build::Toolchain;
 
+// Nightly used to build the eBPF objects. Keep in sync with the CI workflows,
+// Dockerfiles and nix/package.nix, and bump together with bpf-linker.
+const EBPF_TOOLCHAIN: &str = "nightly-2026-10-17";
+
 fn main() -> anyhow::Result<()> {
     let xdp = std::env::var_os("CARGO_FEATURE_XDP").is_some();
     let tc = std::env::var_os("CARGO_FEATURE_TC").is_some();
@@ -34,6 +38,6 @@ fn main() -> anyhow::Result<()> {
             features: &features,
             ..Default::default()
         }],
-        Toolchain::Nightly,
+        Toolchain::Custom(EBPF_TOOLCHAIN),
     )
 }

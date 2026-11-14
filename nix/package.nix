@@ -14,18 +14,18 @@ let
   manifest = lib.importTOML ../Cargo.toml;
 
   # Aya builds the eBPF objects with `-Z build-std=core`, which needs a nightly
-  # toolchain with rust-src. Pinned to match the CI nightly; bump together with
-  # bpf-linker when the LLVM major version changes.
+  # toolchain with rust-src. Pinned to match EBPF_TOOLCHAIN in build.rs; bump
+  # together with bpf-linker when the LLVM major version changes.
   toolchain = rust-bin.nightly."2026-10-17".minimal.override {
     extensions = [ "rust-src" ];
   };
 
   bpf-linker = stdenv.mkDerivation rec {
     pname = "bpf-linker";
-    version = "0.11.0";
+    version = "0.11.1";
     src = fetchurl {
       url = "https://github.com/aya-rs/bpf-linker/releases/download/v${version}/bpf-linker-x86_64-unknown-linux-musl.tar.zst";
-      sha256 = "10f62ba9ab7e544d538370552660efcb4f1a19153d5752bbf0f6b51f3bada450";
+      sha256 = "e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8";
     };
     nativeBuildInputs = [ zstd ];
     sourceRoot = ".";
