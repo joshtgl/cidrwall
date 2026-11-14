@@ -174,8 +174,8 @@ docker build -f Dockerfile.alpine -t cidrwall:alpine .
 ## Tests
 
 ```console
-cargo binstall bpf-linker
-rustup toolchain install nightly --profile minimal --component rust-src
+cargo binstall bpf-linker@0.11.1
+rustup toolchain install nightly-2026-10-17 --profile minimal --component rust-src
 cargo test
 sudo ./tests/netns.sh
 ```

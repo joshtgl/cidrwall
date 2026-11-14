@@ -9,6 +9,9 @@
   "rangeStrategy": "bump",
   "dependencyDashboard": true,
   "prConcurrentLimit": 5,
+  "nix": {
+    "enabled": true
+  },
   "lockFileMaintenance": {
     "enabled": true,
     "schedule": [
@@ -48,6 +51,25 @@
       ],
       "depNameTemplate": "cargo-deny",
       "datasourceTemplate": "crate"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github\\/workflows\\/(ci|release|release-artifacts)\\.yml$/",
+        "/^Dockerfile\\.(alpine|debian)$/",
+        "/^nix\\/package\\.nix$/",
+        "/^README\\.md$/"
+      ],
+      "matchStrings": [
+        "tool: bpf-linker@(?<currentValue>\\S+)",
+        "cargo binstall bpf-linker@(?<currentValue>\\S+)",
+        "aya-rs/bpf-linker/releases/download/v(?<currentValue>\\d+\\.\\d+\\.\\d+)/",
+        "pname = \"bpf-linker\";\\n\\s+version = \"(?<currentValue>[^\"]+)\";"
+      ],
+      "depNameTemplate": "bpf-linker",
+      "packageNameTemplate": "aya-rs/bpf-linker",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.+)$"
     }
   ],
   "packageRules": [
@@ -59,6 +81,26 @@
       "matchUpdateTypes": [
         "!lockFileMaintenance"
       ]
+    },
+    {
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "lockFileMaintenance"
+      ],
+      "branchTopic": "cargo-lock-maintenance",
+      "commitMessageTopic": "Cargo.lock"
+    },
+    {
+      "matchManagers": [
+        "nix"
+      ],
+      "matchUpdateTypes": [
+        "lockFileMaintenance"
+      ],
+      "branchTopic": "flake-lock-maintenance",
+      "commitMessageTopic": "flake.lock"
     },
     {
       "matchManagers": [
@@ -77,6 +119,15 @@
       "minimumReleaseAge": "3 days",
       "prCreation": "not-pending",
       "internalChecksFilter": "strict"
+    },
+    {
+      "matchDepNames": [
+        "bpf-linker"
+      ],
+      "automerge": false,
+      "prBodyNotes": [
+        "Update the bpf-linker release SHA-256 in `Dockerfile.alpine`, `Dockerfile.debian` and `nix/package.nix` before merging, and check it supports the LLVM version of the pinned eBPF nightly (`EBPF_TOOLCHAIN` in `build.rs`)."
+      ]
     }
   ]
 }

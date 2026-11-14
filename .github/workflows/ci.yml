@@ -25,7 +25,7 @@ jobs:
       - name: Install nightly eBPF toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-10-17
           components: rust-src
 
       - name: Install stable host toolchain
@@ -36,7 +36,7 @@ jobs:
       - name: Install bpf-linker
         uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
-          tool: bpf-linker@0.11.0
+          tool: bpf-linker@0.11.1
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -100,6 +100,24 @@ jobs:
             ghcr.io/${{ github.repository }}:dev-${{ matrix.variant }}-${{ github.sha }}
           cache-from: type=gha,scope=${{ matrix.variant }}
           cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
+
+  nix:
+    name: Nix flake checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Run flake checks
+        run: nix flake check
 
   advisories:
     name: Security advisories

@@ -4,9 +4,9 @@ FROM rust:1.98-trixie AS builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl libmnl-dev libnftnl-dev pkg-config zstd \
-    && rustup toolchain install nightly --profile minimal --component rust-src \
-    && curl -fsSL https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/bpf-linker-x86_64-unknown-linux-musl.tar.zst -o /tmp/bpf-linker.tar.zst \
-    && echo "10f62ba9ab7e544d538370552660efcb4f1a19153d5752bbf0f6b51f3bada450  /tmp/bpf-linker.tar.zst" | sha256sum -c - \
+    && rustup toolchain install nightly-2026-10-17 --profile minimal --component rust-src \
+    && curl -fsSL https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-x86_64-unknown-linux-musl.tar.zst -o /tmp/bpf-linker.tar.zst \
+    && echo "e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8  /tmp/bpf-linker.tar.zst" | sha256sum -c - \
     && tar -xpf /tmp/bpf-linker.tar.zst -C /usr/local/bin \
     && rm -rf /var/lib/apt/lists/*
 
