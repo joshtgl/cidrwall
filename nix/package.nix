@@ -22,7 +22,7 @@ let
 
   bpf-linker = stdenv.mkDerivation rec {
     pname = "bpf-linker";
-    version = "0.11.1";
+    version = "0.13.0";
     src = fetchurl {
       url = "https://github.com/aya-rs/bpf-linker/releases/download/v${version}/bpf-linker-x86_64-unknown-linux-musl.tar.zst";
       sha256 = "e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8";
