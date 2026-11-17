@@ -10,7 +10,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Atomically enforce CIDR blocklists with nftables, XDP, and TCX"
 repository = "https://github.com/joshtgl/cidrwall"
-include = ["src/**", "build.rs", "README.md", "CHANGELOG.md", "config/**"]
+include = ["src/**", "build.rs", "ebpf-toolchain", "README.md", "CHANGELOG.md", "config/**"]
 
 [features]
 default = ["native-netlink", "xdp", "tc"]

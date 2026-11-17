@@ -40,10 +40,13 @@ jobs:
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install -y libmnl-dev libnftnl-dev pkg-config
 
+      - name: Read pinned eBPF toolchain
+        run: echo "CIDRWALL_EBPF_TOOLCHAIN=$(cat ebpf-toolchain)" >> "$GITHUB_ENV"
+
       - name: Install nightly eBPF toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: nightly-2026-10-17
+          toolchain: ${{ env.CIDRWALL_EBPF_TOOLCHAIN }}
           components: rust-src
 
       - name: Install stable host toolchain
@@ -124,11 +127,21 @@ jobs:
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install -y libmnl-dev libnftnl-dev pkg-config
 
+      - name: Read pinned eBPF toolchain
+        run: echo "CIDRWALL_EBPF_TOOLCHAIN=$(cat ebpf-toolchain)" >> "$GITHUB_ENV"
+
       - name: Install nightly eBPF toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: nightly-2026-10-17
+          toolchain: ${{ env.CIDRWALL_EBPF_TOOLCHAIN }}
           components: rust-src
+
+      # The published 0.1.3 build.rs (the cargo-semver-checks baseline) builds the
+      # eBPF objects with plain `nightly` and ignores CIDRWALL_EBPF_TOOLCHAIN, so
+      # point `nightly` at the pinned toolchain. Remove once the latest crates.io
+      # release is 0.1.4 or newer.
+      - name: Alias nightly to pinned eBPF toolchain for 0.1.3 semver baseline
+        run: rustup toolchain link nightly "$(rustc +"$CIDRWALL_EBPF_TOOLCHAIN" --print sysroot)"
 
       - name: Install stable host toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable

@@ -14,9 +14,9 @@ let
   manifest = lib.importTOML ../Cargo.toml;
 
   # Aya builds the eBPF objects with `-Z build-std=core`, which needs a nightly
-  # toolchain with rust-src. Pinned to match EBPF_TOOLCHAIN in build.rs; bump
+  # toolchain with rust-src. Pinned by ../ebpf-toolchain, shared with build.rs; bump
   # together with bpf-linker when the LLVM major version changes.
-  toolchain = rust-bin.nightly."2026-10-17".minimal.override {
+  toolchain = rust-bin.nightly.${lib.removePrefix "nightly-" (lib.trim (builtins.readFile ../ebpf-toolchain))}.minimal.override {
     extensions = [ "rust-src" ];
   };
 
@@ -42,6 +42,7 @@ let
       ../Cargo.toml
       ../Cargo.lock
       ../build.rs
+      ../ebpf-toolchain
       ../src
       ../config
       ../cidrwall-common
