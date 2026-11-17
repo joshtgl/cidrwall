@@ -22,10 +22,13 @@ jobs:
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install -y libmnl-dev libnftnl-dev nftables iproute2 iputils-ping pkg-config util-linux
 
+      - name: Read pinned eBPF toolchain
+        run: echo "CIDRWALL_EBPF_TOOLCHAIN=$(cat ebpf-toolchain)" >> "$GITHUB_ENV"
+
       - name: Install nightly eBPF toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: nightly-2026-10-17
+          toolchain: ${{ env.CIDRWALL_EBPF_TOOLCHAIN }}
           components: rust-src
 
       - name: Install stable host toolchain
