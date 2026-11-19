@@ -267,7 +267,7 @@ impl<B: Backend> Daemon<B> {
             let active = self
                 .active
                 .clone()
-                .expect("replacement retained active state");
+                .context("replacement did not retain active state")?;
             self.verify_candidate(&active, None, reason)?;
             log::info!(
                 "sequential blocklist replacement complete: reason={reason} inbound_ipv4_set={} inbound_ipv6_set={} outbound_ipv4_set={} outbound_ipv6_set={}",
@@ -383,15 +383,14 @@ impl<B: Backend> Daemon<B> {
                 direction.name()
             );
         }
-        if self.active.is_none() {
+        let Some(mut candidate) = self.active.clone() else {
             return self.replace_both(reason);
-        }
+        };
         log::info!(
             "blocklist reload triggered: reason={reason} direction={}",
             direction_name(direction)
         );
         let stage = self.stage(direction, reason)?;
-        let mut candidate = self.active.clone().expect("checked active state");
         candidate.set(direction, stage.clone());
         if let Err(error) = self.verify_candidate(&candidate, Some(direction), reason) {
             if let Err(cleanup) = self.backend.discard(&self.config, &stage) {
@@ -419,7 +418,7 @@ impl<B: Backend> Daemon<B> {
         }
         let generation = candidate
             .get(direction)
-            .expect("activated direction is present in candidate");
+            .context("activated direction is missing from candidate")?;
         log::info!(
             "activated blocklist generation: reason={reason} direction={} ipv4_set={} ipv4_set_elements={} ipv4_boundary_elements={} ipv6_set={} ipv6_set_elements={} ipv6_boundary_elements={}",
             direction_name(direction),

@@ -291,7 +291,9 @@ fn ebpf_samples(
         };
         for family in Family::ALL {
             for (verdict, dropped) in [("pass", false), ("drop", true)] {
-                let counter = counters.slots[counter_index(family, dropped)];
+                let Some(&counter) = counters.slots.get(counter_index(family, dropped)) else {
+                    continue;
+                };
                 samples.push(PacketSample {
                     engine,
                     direction,

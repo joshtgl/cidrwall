@@ -122,8 +122,8 @@ fn read_array<const N: usize>(data: usize, end: usize, offset: usize) -> Result<
     }
     let mut value = [0; N];
     let mut index = 0;
-    while index < N {
-        value[index] = unsafe { *((data + offset + index) as *const u8) };
+    while let Some(byte) = value.get_mut(index) {
+        *byte = unsafe { *((data + offset + index) as *const u8) };
         index += 1;
     }
     Ok(value)

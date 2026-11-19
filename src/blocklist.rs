@@ -185,7 +185,10 @@ pub fn stream_chunks(
     max_boundary_elements: usize,
     mut emit: impl FnMut(&[AddressInterval]) -> Result<()>,
 ) -> Result<StreamStats> {
-    assert!(max_boundary_elements > 0);
+    anyhow::ensure!(
+        max_boundary_elements > 0,
+        "max_boundary_elements must be positive"
+    );
     let mut stats = StreamStats::default();
     let mut chunk = Vec::new();
     let mut chunk_boundaries = 0usize;
@@ -259,8 +262,19 @@ pub fn stream_chunks(
                             pending = Some(Pending::V4 { first, last });
                         }
                     }
-                    None => pending = Some(Pending::V4 { first, last }),
-                    Some(Pending::V6 { .. }) => unreachable!(),
+                    // The family switch already flushed any other-family interval; flushing
+                    // again keeps it from being dropped if that ever changes.
+                    None | Some(Pending::V6 { .. }) => {
+                        flush_pending(
+                            &mut pending,
+                            &mut chunk,
+                            &mut chunk_boundaries,
+                            max_boundary_elements,
+                            &mut stats,
+                            &mut emit,
+                        )?;
+                        pending = Some(Pending::V4 { first, last });
+                    }
                 }
             }
             IpNet::V6(net) => {
@@ -317,8 +331,19 @@ pub fn stream_chunks(
                             pending = Some(Pending::V6 { first, last });
                         }
                     }
-                    None => pending = Some(Pending::V6 { first, last }),
-                    Some(Pending::V4 { .. }) => unreachable!(),
+                    // The family switch already flushed any other-family interval; flushing
+                    // again keeps it from being dropped if that ever changes.
+                    None | Some(Pending::V4 { .. }) => {
+                        flush_pending(
+                            &mut pending,
+                            &mut chunk,
+                            &mut chunk_boundaries,
+                            max_boundary_elements,
+                            &mut stats,
+                            &mut emit,
+                        )?;
+                        pending = Some(Pending::V6 { first, last });
+                    }
                 }
             }
         }

@@ -10,5 +10,16 @@ repository = "https://github.com/joshtgl/cidrwall"
 default = []
 user = ["aya"]
 
+[lints.clippy]
+# Runtime code must return errors instead of panicking. Tests are exempt via clippy.toml.
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+unwrap_used = "deny"
+
 [dependencies]
 aya = { version = "0.16.0", optional = true }

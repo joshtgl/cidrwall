@@ -269,35 +269,32 @@ mod native {
 
     const IN_DISPATCH: &CStr = c"inbound_dispatch";
     const OUT_DISPATCH: &CStr = c"outbound_dispatch";
-    const DROP_COUNTERS: [(Direction, &str, &CStr); 4] = [
-        (Direction::Inbound, "ipv4", c"inbound_ipv4_drops"),
-        (Direction::Inbound, "ipv6", c"inbound_ipv6_drops"),
-        (Direction::Outbound, "ipv4", c"outbound_ipv4_drops"),
-        (Direction::Outbound, "ipv6", c"outbound_ipv6_drops"),
+    const DROP_COUNTERS: [(Direction, &str, u8); 4] = [
+        (Direction::Inbound, "ipv4", libc::NFPROTO_IPV4 as u8),
+        (Direction::Inbound, "ipv6", libc::NFPROTO_IPV6 as u8),
+        (Direction::Outbound, "ipv4", libc::NFPROTO_IPV4 as u8),
+        (Direction::Outbound, "ipv6", libc::NFPROTO_IPV6 as u8),
     ];
 
     fn drop_counter_name(direction: Direction, family: u8) -> &'static CStr {
-        let family = if family as i32 == libc::NFPROTO_IPV4 {
-            "ipv4"
-        } else {
-            "ipv6"
-        };
-        DROP_COUNTERS
-            .iter()
-            .find(|(d, f, _)| *d == direction && *f == family)
-            .map(|(_, _, name)| *name)
-            .expect("every direction and family has a drop counter")
+        let ipv4 = family as i32 == libc::NFPROTO_IPV4;
+        match (direction, ipv4) {
+            (Direction::Inbound, true) => c"inbound_ipv4_drops",
+            (Direction::Inbound, false) => c"inbound_ipv6_drops",
+            (Direction::Outbound, true) => c"outbound_ipv4_drops",
+            (Direction::Outbound, false) => c"outbound_ipv6_drops",
+        }
     }
 
     pub fn drop_counters(config: &Config) -> Result<Vec<DropCounter>, BackendError> {
         let objects = counter_inventory(&config.nftables.table)?;
         Ok(DROP_COUNTERS
             .iter()
-            .filter_map(|(direction, family, name)| {
-                let name = name.to_str().expect("counter names are ASCII");
+            .filter_map(|(direction, family, nfproto)| {
+                let name = drop_counter_name(*direction, *nfproto).to_bytes();
                 objects
                     .iter()
-                    .find(|object| object.name == name)
+                    .find(|object| object.name.as_bytes() == name)
                     .map(|object| DropCounter {
                         direction: *direction,
                         family,
@@ -414,13 +411,13 @@ mod native {
             stage: &DirectionGeneration,
             intervals: &[AddressInterval],
         ) -> Result<(), BackendError> {
-            if intervals.is_empty() {
+            let Some(first) = intervals.first() else {
                 return Ok(());
-            }
+            };
             let table_name = cstring(&config.nftables.table)?;
             let table = Table::new(&table_name, ProtoFamily::Inet);
             let mut batch = Batch::with_page_size(config.nftables.batch_page_bytes);
-            match intervals[0] {
+            match first {
                 AddressInterval::V4 { .. } => {
                     let name = cstring(&stage.ipv4_set)?;
                     let mut set = IntervalSet::<Ipv4Addr>::existing(&name, &table);
@@ -1034,7 +1031,7 @@ mod native {
                 let mut boundaries = 0usize;
                 for interval in intervals {
                     let AddressInterval::V4 { first, after_last } = interval else {
-                        unreachable!()
+                        panic!("IPv4 test data produced an IPv6 interval");
                     };
                     set.add_range(first, after_last.as_ref())?;
                     boundaries += interval.boundary_elements();

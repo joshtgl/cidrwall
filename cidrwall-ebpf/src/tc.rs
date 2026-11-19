@@ -25,12 +25,18 @@ static COUNTERS: PerCpuHashMap<u32, Counters> = PerCpuHashMap::pinned(MAX_COUNTE
 #[map]
 static COUNTERS_UNKNOWN: PerCpuArray<Counters> = PerCpuArray::pinned(1, 0);
 
+// Private: the `classifier` wrapper inherits this visibility, and a public safe function taking
+// the kernel's raw `__sk_buff` pointer trips `clippy::not_unsafe_ptr_arg_deref`.
 #[classifier]
-pub fn cidrwall_tc(ctx: TcContext) -> i32 {
+fn cidrwall_tc(ctx: TcContext) -> i32 {
     let (family, blocked) = classify(&ctx).unwrap_or((Family::Other, false));
-    let ifindex = unsafe { (*(ctx.as_ptr() as *const __sk_buff)).ifindex };
-    record(ifindex, family, blocked, u64::from(ctx.len()));
+    record(ifindex(&ctx), family, blocked, u64::from(ctx.len()));
     if blocked { TC_ACT_SHOT } else { TC_ACT_UNSPEC }
+}
+
+fn ifindex(ctx: &TcContext) -> u32 {
+    // SAFETY: the kernel passes classifiers a valid `__sk_buff` that outlives the program run.
+    unsafe { (*(ctx.as_ptr() as *const __sk_buff)).ifindex }
 }
 
 /// Entries are created by the daemon at attach time; this program only looks them up.

@@ -44,7 +44,7 @@ unsafe trait Deallocator<T> {
 
 /// Owns a non-null C allocation until it is dropped or explicitly transferred.
 struct OwnedPtr<T, D: Deallocator<T>> {
-    pointer: Option<NonNull<T>>,
+    pointer: NonNull<T>,
     deallocator: D,
 }
 
@@ -66,30 +66,26 @@ impl<T, D: Deallocator<T>> OwnedPtr<T, D> {
             )
         })?;
         Ok(Self {
-            pointer: Some(pointer),
+            pointer,
             deallocator,
         })
     }
 
     fn pointer(&self) -> NonNull<T> {
         self.pointer
-            .expect("C allocation ownership was transferred")
     }
 
-    fn into_non_null(mut self) -> NonNull<T> {
-        self.pointer
-            .take()
-            .expect("C allocation ownership was transferred")
+    /// Transfers ownership to the caller; the guard no longer frees the allocation.
+    fn into_non_null(self) -> NonNull<T> {
+        std::mem::ManuallyDrop::new(self).pointer
     }
 }
 
 impl<T, D: Deallocator<T>> Drop for OwnedPtr<T, D> {
     fn drop(&mut self) {
-        if let Some(pointer) = self.pointer.take() {
-            // SAFETY: A pointer remaining in the guard is live, uniquely owned, and paired with
-            // this deallocator by `from_alloc`.
-            unsafe { self.deallocator.deallocate(pointer) };
-        }
+        // SAFETY: The guard still owns its live pointer, paired with this deallocator by
+        // `from_alloc`; `into_non_null` skips this drop when ownership is transferred.
+        unsafe { self.deallocator.deallocate(self.pointer) };
     }
 }
 
@@ -180,14 +176,16 @@ unsafe fn remove_top_level_attribute(buffer: *mut c_void, target: u16) {
     let bytes = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), len) };
     let mut offset = size_of::<libc::nlmsghdr>() + NFGENMSG_LEN;
     while offset + NLA_HEADER_LEN <= len {
-        let attr_len =
-            u16::from_ne_bytes(bytes[offset..offset + 2].try_into().expect("NLA header")) as usize;
+        let (Some(attr_len), Some(attr_type)) =
+            (read_ne_u16(bytes, offset), read_ne_u16(bytes, offset + 2))
+        else {
+            return;
+        };
+        let attr_len = attr_len as usize;
         if attr_len < NLA_HEADER_LEN || offset + attr_len > len {
             return;
         }
-        let attr_type =
-            u16::from_ne_bytes(bytes[offset + 2..offset + 4].try_into().expect("NLA type"))
-                & NLA_TYPE_MASK;
+        let attr_type = attr_type & NLA_TYPE_MASK;
         let aligned = attr_len.next_multiple_of(4);
         if offset + aligned > len {
             return;
@@ -200,6 +198,11 @@ unsafe fn remove_top_level_attribute(buffer: *mut c_void, target: u16) {
         }
         offset += aligned;
     }
+}
+
+fn read_ne_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let bytes = bytes.get(offset..offset.checked_add(2)?)?;
+    Some(u16::from_ne_bytes(bytes.try_into().ok()?))
 }
 
 /// Lookup expression for a named set that was created by an earlier transaction.
@@ -606,15 +609,14 @@ impl SetInfo {
         };
         let mut offset = size_of::<libc::nlmsghdr>() + NFGENMSG_LEN;
         while offset + NLA_HEADER_LEN <= bytes.len() {
-            let attr_len = u16::from_ne_bytes(bytes[offset..offset + 2].try_into().ok()?) as usize;
-            let attr_type =
-                u16::from_ne_bytes(bytes[offset + 2..offset + 4].try_into().ok()?) & NLA_TYPE_MASK;
+            let attr_len = read_ne_u16(bytes, offset)? as usize;
+            let attr_type = read_ne_u16(bytes, offset + 2)? & NLA_TYPE_MASK;
             if attr_len < NLA_HEADER_LEN || offset + attr_len > bytes.len() {
                 return None;
             }
             if attr_type == NFTA_SET_COUNT && attr_len >= NLA_HEADER_LEN + 4 {
                 return Some(u32::from_be_bytes(
-                    bytes[offset + 4..offset + 8].try_into().ok()?,
+                    bytes.get(offset + 4..offset + 8)?.try_into().ok()?,
                 ));
             }
             offset += attr_len.next_multiple_of(4);
@@ -844,9 +846,9 @@ impl NetlinkRequest {
     }
 
     pub(super) fn as_bytes(&self) -> &[u8] {
-        self.buffer
-            .prefix(self.len)
-            .expect("validated netlink request length")
+        // SAFETY: `new` rejects any `len` beyond the buffer's capacity, the fields are private, and
+        // the whole allocation is initialized `u64` storage.
+        unsafe { std::slice::from_raw_parts(self.buffer.words.as_ptr().cast::<u8>(), self.len) }
     }
 }
 
@@ -999,6 +1001,7 @@ mod tests {
         let header = buffer.as_bytes_mut().as_mut_ptr().cast::<libc::nlmsghdr>();
         // SAFETY: The aligned allocation contains a complete header and all attributes fit in it.
         unsafe { (*header).nlmsg_len = len as u32 };
+        assert!(len <= buffer.capacity());
         NetlinkRequest { buffer, len }
     }
 
