@@ -29,12 +29,13 @@ jobs:
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: ${{ env.CIDRWALL_EBPF_TOOLCHAIN }}
-          components: rust-src
+          components: rust-src, clippy
 
       - name: Install stable host toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable
+          components: clippy
 
       - name: Install bpf-linker
         uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
@@ -46,6 +47,21 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --check
+
+      - name: Run clippy
+        run: |
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo clippy --locked --all-targets --no-default-features -- -D warnings
+          for feature in native-netlink xdp tc; do
+            cargo clippy --locked --all-targets --no-default-features --features "$feature" -- -D warnings
+          done
+
+      - name: Run clippy on eBPF programs
+        working-directory: cidrwall-ebpf
+        run: >-
+          cargo +"$CIDRWALL_EBPF_TOOLCHAIN" clippy --locked --release --bins
+          --features xdp-program,tc-program --target bpfel-unknown-none -Z build-std=core
+          -- -D warnings
 
       - name: Run Rust tests
         run: cargo test --locked

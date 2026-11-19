@@ -41,6 +41,10 @@ cleanup_on_exit = false
 debounce_ms = 500
 reconcile_secs = 60
 
+# Uncomment to serve Prometheus metrics at http://127.0.0.1:9737/metrics.
+# [metrics]
+# listen = "127.0.0.1:9737"
+
 [[xdp.rules]]
 blocklist = "inbound"
 ingress_zones = ["WAN"]

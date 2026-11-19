@@ -24,6 +24,7 @@ pub struct DirectionGeneration {
     pub ipv6_intervals: u64,
     pub ipv4_boundaries: u64,
     pub ipv6_boundaries: u64,
+    pub source_cidrs: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -143,10 +144,25 @@ pub fn apply_stats(stage: &mut DirectionGeneration, stats: StreamStats) {
     stage.ipv6_intervals = stats.ipv6_intervals;
     stage.ipv4_boundaries = stats.ipv4_boundaries;
     stage.ipv6_boundaries = stats.ipv6_boundaries;
+    stage.source_cidrs = stats.cidrs;
+}
+
+/// Packets and bytes dropped by one nftables lookup rule, read from its named counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropCounter {
+    pub direction: Direction,
+    pub family: &'static str,
+    pub packets: u64,
+    pub bytes: u64,
 }
 
 #[cfg(feature = "native-netlink")]
-pub use native::NftnlBackend;
+pub use native::{NftnlBackend, drop_counters};
+
+#[cfg(not(feature = "native-netlink"))]
+pub fn drop_counters(_: &Config) -> Result<Vec<DropCounter>, BackendError> {
+    Err(BackendError::Disabled)
+}
 
 #[cfg(not(feature = "native-netlink"))]
 #[derive(Default)]
@@ -235,8 +251,9 @@ impl Backend for NftnlBackend {
 #[cfg(feature = "native-netlink")]
 mod native {
     use super::ffi::{
-        AlignedNetlinkBuffer, ExistingElements, ExistingSetMessage, Flowtable, IntervalSet,
-        NamedLookup, NetlinkRequest, RuleFlush, SetInfo, TableInfo,
+        AlignedNetlinkBuffer, CounterInfo, CounterObject, ExistingElements, ExistingSetMessage,
+        Flowtable, IntervalSet, NamedCounter, NamedLookup, NetlinkRequest, RuleFlush, SetInfo,
+        TableInfo,
     };
     use super::*;
     use crate::zones::Chain as RuleChain;
@@ -252,6 +269,41 @@ mod native {
 
     const IN_DISPATCH: &CStr = c"inbound_dispatch";
     const OUT_DISPATCH: &CStr = c"outbound_dispatch";
+    const DROP_COUNTERS: [(Direction, &str, u8); 4] = [
+        (Direction::Inbound, "ipv4", libc::NFPROTO_IPV4 as u8),
+        (Direction::Inbound, "ipv6", libc::NFPROTO_IPV6 as u8),
+        (Direction::Outbound, "ipv4", libc::NFPROTO_IPV4 as u8),
+        (Direction::Outbound, "ipv6", libc::NFPROTO_IPV6 as u8),
+    ];
+
+    fn drop_counter_name(direction: Direction, family: u8) -> &'static CStr {
+        let ipv4 = family as i32 == libc::NFPROTO_IPV4;
+        match (direction, ipv4) {
+            (Direction::Inbound, true) => c"inbound_ipv4_drops",
+            (Direction::Inbound, false) => c"inbound_ipv6_drops",
+            (Direction::Outbound, true) => c"outbound_ipv4_drops",
+            (Direction::Outbound, false) => c"outbound_ipv6_drops",
+        }
+    }
+
+    pub fn drop_counters(config: &Config) -> Result<Vec<DropCounter>, BackendError> {
+        let objects = counter_inventory(&config.nftables.table)?;
+        Ok(DROP_COUNTERS
+            .iter()
+            .filter_map(|(direction, family, nfproto)| {
+                let name = drop_counter_name(*direction, *nfproto).to_bytes();
+                objects
+                    .iter()
+                    .find(|object| object.name.as_bytes() == name)
+                    .map(|object| DropCounter {
+                        direction: *direction,
+                        family,
+                        packets: object.packets,
+                        bytes: object.bytes,
+                    })
+            })
+            .collect())
+    }
 
     pub struct NftnlBackend {
         next_generation: u64,
@@ -349,6 +401,7 @@ mod native {
                 ipv6_intervals: 0,
                 ipv4_boundaries: 0,
                 ipv6_boundaries: 0,
+                source_cidrs: 0,
             })
         }
 
@@ -358,13 +411,13 @@ mod native {
             stage: &DirectionGeneration,
             intervals: &[AddressInterval],
         ) -> Result<(), BackendError> {
-            if intervals.is_empty() {
+            let Some(first) = intervals.first() else {
                 return Ok(());
-            }
+            };
             let table_name = cstring(&config.nftables.table)?;
             let table = Table::new(&table_name, ProtoFamily::Inet);
             let mut batch = Batch::with_page_size(config.nftables.batch_page_bytes);
-            match intervals[0] {
+            match first {
                 AddressInterval::V4 { .. } => {
                     let name = cstring(&stage.ipv4_set)?;
                     let mut set = IntervalSet::<Ipv4Addr>::existing(&name, &table);
@@ -625,6 +678,11 @@ mod native {
     ) -> Result<(), BackendError> {
         let v4_name = cstring(&generation.ipv4_set)?;
         let v6_name = cstring(&generation.ipv6_set)?;
+        for family in [libc::NFPROTO_IPV4 as u8, libc::NFPROTO_IPV6 as u8] {
+            let counter =
+                CounterObject::new(drop_counter_name(direction, family), chain.get_table());
+            batch.add(&counter, MsgType::Add);
+        }
         add_lookup_rule(batch, chain, direction, &v4_name, libc::NFPROTO_IPV4 as u8);
         add_lookup_rule(batch, chain, direction, &v6_name, libc::NFPROTO_IPV6 as u8);
         Ok(())
@@ -657,6 +715,7 @@ mod native {
         };
         rule.add_expr(&field);
         rule.add_expr(&NamedLookup::new(set_name));
+        rule.add_expr(&NamedCounter::new(drop_counter_name(direction, family)));
         rule.add_expr(&nft_expr!(verdict drop));
         batch.add(&rule, MsgType::Add);
     }
@@ -804,6 +863,37 @@ mod native {
         dump(request, collect, (table.to_owned(), BTreeMap::new(), None)).map(|state| state.1)
     }
 
+    fn counter_inventory(table: &str) -> io::Result<Vec<CounterInfo>> {
+        fn collect(message: &libc::nlmsghdr, state: &mut CounterDump) -> libc::c_int {
+            match CounterInfo::parse(message) {
+                Ok(Some(counter)) => {
+                    if counter.table == state.table {
+                        state.counters.push(counter);
+                    }
+                    mnl::mnl_sys::MNL_CB_OK
+                }
+                Ok(None) => mnl::mnl_sys::MNL_CB_OK,
+                Err(error) => {
+                    state.error = Some(error);
+                    mnl::mnl_sys::MNL_CB_ERROR
+                }
+            }
+        }
+        let request = NetlinkRequest::object_dump(1)?;
+        let state = CounterDump {
+            table: table.to_owned(),
+            counters: Vec::new(),
+            error: None,
+        };
+        dump(request, collect, state).map(|state| state.counters)
+    }
+
+    struct CounterDump {
+        table: String,
+        counters: Vec<CounterInfo>,
+        error: Option<io::Error>,
+    }
+
     trait DumpState {
         fn take_error(&mut self) -> Option<io::Error>;
     }
@@ -815,6 +905,11 @@ mod native {
     impl DumpState for (String, BTreeMap<String, Option<u32>>, Option<io::Error>) {
         fn take_error(&mut self) -> Option<io::Error> {
             self.2.take()
+        }
+    }
+    impl DumpState for CounterDump {
+        fn take_error(&mut self) -> Option<io::Error> {
+            self.error.take()
         }
     }
     fn dump<S: DumpState>(
@@ -936,7 +1031,7 @@ mod native {
                 let mut boundaries = 0usize;
                 for interval in intervals {
                     let AddressInterval::V4 { first, after_last } = interval else {
-                        unreachable!()
+                        panic!("IPv4 test data produced an IPv6 interval");
                     };
                     set.add_range(first, after_last.as_ref())?;
                     boundaries += interval.boundary_elements();
@@ -1023,6 +1118,7 @@ pub mod test_backend {
                 ipv6_intervals: 0,
                 ipv4_boundaries: 0,
                 ipv6_boundaries: 0,
+                source_cidrs: 0,
             })
         }
         fn populate(

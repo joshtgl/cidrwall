@@ -5,6 +5,7 @@ use crate::xdp::XdpManager;
 use crate::{
     blocklist,
     config::{Config, Direction, open_blocklist},
+    metrics::{self, Engine, Metrics},
     netlink::{
         ActiveGenerations, Backend, BackendError, DirectionGeneration, Health, LayoutStatus,
         apply_stats,
@@ -30,6 +31,7 @@ pub struct Daemon<B> {
     protected: BTreeSet<String>,
     active: Option<ActiveGenerations>,
     backend: B,
+    metrics: Metrics,
     nft_started: bool,
     #[cfg(feature = "xdp")]
     xdp: Option<XdpManager>,
@@ -84,12 +86,29 @@ impl<B: Backend> Daemon<B> {
         if !config.tc.rules.is_empty() {
             bail!("TC rules were configured, but this cidrwall build has no TC support");
         }
+        let metrics = Metrics::default();
+        for direction in [Direction::Inbound, Direction::Outbound] {
+            if config.uses_nftables(direction) {
+                metrics.configure(Engine::Nftables, direction);
+            }
+        }
+        #[cfg(feature = "xdp")]
+        if let Some(xdp) = &xdp {
+            metrics.configure(Engine::Xdp, Direction::Inbound);
+            metrics.set_interfaces(Engine::Xdp, xdp.interfaces().clone());
+        }
+        #[cfg(feature = "tc")]
+        if let Some(tc) = &tc {
+            metrics.configure(Engine::Tc, Direction::Outbound);
+            metrics.set_interfaces(Engine::Tc, tc.interfaces().clone());
+        }
         Ok(Self {
             config,
             rules,
             protected,
             active: None,
             backend,
+            metrics,
             nft_started: false,
             #[cfg(feature = "xdp")]
             xdp,
@@ -105,6 +124,9 @@ impl<B: Backend> Daemon<B> {
     }
 
     pub fn start(mut self) -> Result<()> {
+        if let Some(address) = self.config.metrics.listen {
+            metrics::spawn(address, self.config.clone(), self.metrics.clone())?;
+        }
         let result = self.initial_load().and_then(|()| self.watch());
         let mut cleanup_errors = Vec::new();
         #[cfg(feature = "xdp")]
@@ -161,13 +183,17 @@ impl<B: Backend> Daemon<B> {
         #[cfg(feature = "xdp")]
         if let Some(xdp) = &mut self.xdp {
             self.xdp_started = true;
-            xdp.reload(&self.config, "startup")
+            let stats = xdp
+                .reload(&self.config, "startup")
                 .context("startup could not activate the XDP blocklist")?;
+            record_ebpf(&self.metrics, Engine::Xdp, Direction::Inbound, stats);
         }
         #[cfg(feature = "tc")]
         if let Some(tc) = &mut self.tc {
-            tc.reload(&self.config, "startup")
+            let stats = tc
+                .reload(&self.config, "startup")
                 .context("startup could not activate the TC blocklist")?;
+            record_ebpf(&self.metrics, Engine::Tc, Direction::Outbound, stats);
             tc.activate()
                 .context("startup could not attach the TCX egress program")?;
             self.tc_started = true;
@@ -241,7 +267,7 @@ impl<B: Backend> Daemon<B> {
             let active = self
                 .active
                 .clone()
-                .expect("replacement retained active state");
+                .context("replacement did not retain active state")?;
             self.verify_candidate(&active, None, reason)?;
             log::info!(
                 "sequential blocklist replacement complete: reason={reason} inbound_ipv4_set={} inbound_ipv6_set={} outbound_ipv4_set={} outbound_ipv6_set={}",
@@ -299,6 +325,9 @@ impl<B: Backend> Daemon<B> {
             return Err(error.into());
         }
         self.active = Some(candidate.clone());
+        for generation in candidate.iter() {
+            record_nft(&self.metrics, generation);
+        }
         match self.backend.cleanup_obsolete(&self.config, &candidate) {
             Ok(()) => log::info!(
                 "obsolete generation cleanup complete: reason={reason} direction=combined"
@@ -354,15 +383,14 @@ impl<B: Backend> Daemon<B> {
                 direction.name()
             );
         }
-        if self.active.is_none() {
+        let Some(mut candidate) = self.active.clone() else {
             return self.replace_both(reason);
-        }
+        };
         log::info!(
             "blocklist reload triggered: reason={reason} direction={}",
             direction_name(direction)
         );
         let stage = self.stage(direction, reason)?;
-        let mut candidate = self.active.clone().expect("checked active state");
         candidate.set(direction, stage.clone());
         if let Err(error) = self.verify_candidate(&candidate, Some(direction), reason) {
             if let Err(cleanup) = self.backend.discard(&self.config, &stage) {
@@ -380,6 +408,7 @@ impl<B: Backend> Daemon<B> {
             return Err(error.into());
         }
         self.active = Some(candidate.clone());
+        record_nft(&self.metrics, &stage);
         match self.backend.cleanup_obsolete(&self.config, &candidate) {
             Ok(()) => log::info!(
                 "obsolete generation cleanup complete: reason={reason} direction={}",
@@ -389,7 +418,7 @@ impl<B: Backend> Daemon<B> {
         }
         let generation = candidate
             .get(direction)
-            .expect("activated direction is present in candidate");
+            .context("activated direction is missing from candidate")?;
         log::info!(
             "activated blocklist generation: reason={reason} direction={} ipv4_set={} ipv4_set_elements={} ipv4_boundary_elements={} ipv6_set={} ipv6_set_elements={} ipv6_boundary_elements={}",
             direction_name(direction),
@@ -493,9 +522,15 @@ impl<B: Backend> Daemon<B> {
                     self.config.runtime.reconcile_secs
                 );
                 if let Err(error) = self.reconcile() {
+                    self.metrics.reconcile_failed();
                     log::error!(
                         "table reconciliation failed; current generation retained: {error:#}"
                     );
+                }
+                #[cfg(feature = "tc")]
+                if let Some(tc) = &self.tc {
+                    self.metrics
+                        .set_interfaces(Engine::Tc, tc.interfaces().clone());
                 }
                 next_reconcile = now + self.config.reconcile();
             }
@@ -544,21 +579,32 @@ impl<B: Backend> Daemon<B> {
         if self.config.uses_nftables(direction)
             && let Err(error) = self.reload_nft_for(direction, reason)
         {
+            self.metrics.apply_failed(Engine::Nftables, direction);
             errors.push(error);
         }
         #[cfg(feature = "xdp")]
         if direction == Direction::Inbound
             && let Some(xdp) = &mut self.xdp
-            && let Err(error) = xdp.reload(&self.config, reason)
         {
-            errors.push(error);
+            match xdp.reload(&self.config, reason) {
+                Ok(stats) => record_ebpf(&self.metrics, Engine::Xdp, direction, stats),
+                Err(error) => {
+                    self.metrics.apply_failed(Engine::Xdp, direction);
+                    errors.push(error);
+                }
+            }
         }
         #[cfg(feature = "tc")]
         if direction == Direction::Outbound
             && let Some(tc) = &mut self.tc
-            && let Err(error) = tc.reload(&self.config, reason)
         {
-            errors.push(error);
+            match tc.reload(&self.config, reason) {
+                Ok(stats) => record_ebpf(&self.metrics, Engine::Tc, direction, stats),
+                Err(error) => {
+                    self.metrics.apply_failed(Engine::Tc, direction);
+                    errors.push(error);
+                }
+            }
         }
         if errors.is_empty() {
             Ok(())
@@ -613,6 +659,34 @@ impl<B: Backend> Daemon<B> {
         }
         Ok(())
     }
+}
+
+fn record_nft(metrics: &Metrics, generation: &DirectionGeneration) {
+    metrics.applied(
+        Engine::Nftables,
+        generation.direction,
+        generation.ipv4_intervals,
+        generation.ipv6_intervals,
+        generation.source_cidrs,
+        None,
+    );
+}
+
+#[cfg(any(feature = "xdp", feature = "tc"))]
+fn record_ebpf(
+    metrics: &Metrics,
+    engine: Engine,
+    direction: Direction,
+    stats: crate::metrics::ApplyStats,
+) {
+    metrics.applied(
+        engine,
+        direction,
+        stats.ipv4_prefixes,
+        stats.ipv6_prefixes,
+        stats.source_cidrs,
+        Some(stats.slot),
+    );
 }
 
 fn direction_name(direction: Direction) -> &'static str {
@@ -706,6 +780,7 @@ mod tests {
             xdp: Xdp::default(),
             tc: Tc::default(),
             runtime: Runtime::default(),
+            metrics: Default::default(),
             rules: Rules {
                 input: vec![RuleMapping {
                     blocklist: Direction::Inbound,

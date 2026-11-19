@@ -51,7 +51,10 @@ ingress_zones = ["WAN"]
 
 `auto` tries native/driver XDP first and falls back to generic/SKB XDP only when native mode is not
 supported. Missing interfaces fail startup. cidrwall will not replace a foreign XDP program, and
-requires a kernel with pinnable BPF links so attachments survive daemon restarts. Two configured
+requires a kernel with pinnable BPF links so attachments survive daemon restarts. On startup,
+cidrwall atomically swaps its current program onto existing links, so upgrades take effect without
+a gap in enforcement. A link keeps the mode it was created with; run `--cleanup xdp` after changing
+`mode` to re-create the links. Two configured
 LPM tries exist per address family, so capacity should account for both slots. The default is five
 million prefixes per map and can be reduced for smaller systems.
 
@@ -156,6 +159,33 @@ cidrwall --config ./config/cidrwall.toml --cleanup all
 Cleanup verifies cidrwall's layout marker before removing state; it does not remove unrecognized
 tables or pinned maps.
 
+## Metrics
+
+cidrwall can serve Prometheus metrics at `/metrics`. The listener is disabled by default; enable it
+with `[metrics] listen = "127.0.0.1:9737"` or `--metrics-listen` / `CIDRWALL_METRICS_LISTEN`. The
+endpoint has no authentication, so keep it on loopback unless a firewall restricts who can reach it.
+Packet counters are read from the kernel when a scrape arrives.
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `cidrwall_packets_total`, `cidrwall_bytes_total` | `backend`, `direction`, `interface`, `family`, `verdict` | Traffic evaluated against a blocklist |
+| `cidrwall_loaded_entries` | `backend`, `direction`, `family` | nftables interval elements or eBPF LPM prefixes in the active generation |
+| `cidrwall_source_cidrs` | `backend`, `direction` | CIDRs read from the blocklist file for the active generation |
+| `cidrwall_active_slot` | `backend`, `direction` | Active A/B map slot (XDP and TC only) |
+| `cidrwall_last_apply_success_timestamp_seconds` | `backend`, `direction` | Unix time of the last successful apply |
+| `cidrwall_last_apply_ok` | `backend`, `direction` | `1` when the most recent apply succeeded |
+| `cidrwall_apply_failures_total` | `backend`, `direction` | Rejected reloads; the previous generation stayed active |
+| `cidrwall_reconcile_failures_total` | | Periodic reconciliations that reported an error |
+| `cidrwall_scrape_errors_total` | `source` | Scrapes that could not read a backend's kernel counters |
+| `cidrwall_build_info` | `version` | Always `1` |
+
+XDP and TC count `drop` and `pass` per attached interface; `family="other"` covers non-IP and
+truncated frames, and `interface=""` collects packets from an interface without its own counter
+entry. Their counters live in pinned per-CPU maps, so they survive daemon restarts until
+`--cleanup` removes the pins. nftables counts drops only, through named counter objects
+(`inbound_ipv4_drops`, `outbound_ipv6_drops`, …) that keep their values across reloads; its series
+have `interface=""` because one rule covers every protected interface.
+
 ## Container
 
 The container needs the host network namespace, `CAP_NET_ADMIN`, and `CAP_BPF` for XDP or TCX on
@@ -177,6 +207,7 @@ docker build -f Dockerfile.alpine -t cidrwall:alpine .
 cargo binstall bpf-linker@0.13.0
 rustup toolchain install "$(cat ebpf-toolchain)" --profile minimal --component rust-src
 cargo test
+cargo build
 sudo ./tests/netns.sh
 ```
 

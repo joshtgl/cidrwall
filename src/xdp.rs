@@ -1,6 +1,8 @@
 use crate::{
     blocklist::{self, AddressPrefix},
     config::{Config, Xdp as XdpConfig, XdpMode as ConfigMode, open_blocklist},
+    counters::{COUNTERS, COUNTERS_UNKNOWN, CounterMaps},
+    metrics::ApplyStats,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use aya::{
@@ -12,6 +14,7 @@ use aya::{
     programs::{
         Xdp, XdpMode,
         links::{FdLink, PinnedLink},
+        xdp::XdpLink,
     },
 };
 use cidrwall_common::{Control, LAYOUT_VERSION, SLOT_COUNT};
@@ -27,7 +30,15 @@ const IPV4_A: &str = "IPV4_A";
 const IPV4_B: &str = "IPV4_B";
 const IPV6_A: &str = "IPV6_A";
 const IPV6_B: &str = "IPV6_B";
-const MAP_NAMES: [&str; 5] = [CONTROL, IPV4_A, IPV4_B, IPV6_A, IPV6_B];
+const MAP_NAMES: [&str; 7] = [
+    CONTROL,
+    IPV4_A,
+    IPV4_B,
+    IPV6_A,
+    IPV6_B,
+    COUNTERS,
+    COUNTERS_UNKNOWN,
+];
 const PROGRAM: &str = "cidrwall";
 const OBJECT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cidrwall-xdp"));
 
@@ -43,6 +54,7 @@ pub struct XdpManager {
     ipv4_b: V4Trie,
     ipv6_a: V6Trie,
     ipv6_b: V6Trie,
+    counters: CounterMaps,
     links: BTreeMap<u32, PinnedLink>,
 }
 
@@ -91,6 +103,7 @@ impl XdpManager {
         let ipv4_b = take_v4(&mut ebpf, IPV4_B)?;
         let ipv6_a = take_v6(&mut ebpf, IPV6_A)?;
         let ipv6_b = take_v6(&mut ebpf, IPV6_B)?;
+        let counters = CounterMaps::take(&mut ebpf, "XDP")?;
         let links = open_owned_links(&xdp, interfaces.keys().copied().collect())?;
 
         let program: &mut Xdp = ebpf
@@ -108,13 +121,15 @@ impl XdpManager {
             ipv4_b,
             ipv6_a,
             ipv6_b,
+            counters,
             links,
         };
+        manager.replace_link_programs()?;
         manager.reconcile_links()?;
         Ok(manager)
     }
 
-    pub fn reload(&mut self, config: &Config, reason: &str) -> Result<()> {
+    pub fn reload(&mut self, config: &Config, reason: &str) -> Result<ApplyStats> {
         let active = self.control.get(&0, 0)?.active_slot;
         let inactive = 1 - active;
         self.clear_slot(inactive)?;
@@ -172,12 +187,16 @@ impl XdpManager {
                 Ok(())
             },
         );
-        if let Err(error) = result {
-            if let Err(clear) = self.clear_slot(inactive) {
-                log::error!("failed to clear rejected XDP staging slot: {clear:#}");
+        let stats = match result {
+            Ok(stats) => stats,
+            Err(error) => {
+                if let Err(clear) = self.clear_slot(inactive) {
+                    log::error!("failed to clear rejected XDP staging slot: {clear:#}");
+                }
+                return Err(error)
+                    .with_context(|| format!("stage XDP blocklist {}", path.display()));
             }
-            return Err(error).with_context(|| format!("stage XDP blocklist {}", path.display()));
-        }
+        };
 
         self.control.set(
             0,
@@ -194,7 +213,16 @@ impl XdpManager {
             "activated XDP blocklist: reason={reason} path={} ipv4_prefixes={ipv4} ipv6_prefixes={ipv6} slot={inactive}",
             path.display()
         );
-        Ok(())
+        Ok(ApplyStats {
+            ipv4_prefixes: ipv4,
+            ipv6_prefixes: ipv6,
+            source_cidrs: stats.cidrs,
+            slot: inactive,
+        })
+    }
+
+    pub fn interfaces(&self) -> &BTreeMap<u32, String> {
+        &self.interfaces
     }
 
     pub fn reconcile(&mut self) -> Result<()> {
@@ -228,6 +256,8 @@ impl XdpManager {
     }
 
     fn reconcile_links(&mut self) -> Result<()> {
+        self.counters
+            .sync(&self.interfaces.keys().copied().collect());
         let missing: Vec<_> = self
             .interfaces
             .iter()
@@ -249,6 +279,37 @@ impl XdpManager {
                     .with_context(|| format!("attach XDP to {name} (ifindex {ifindex})"));
             }
             attached.push(ifindex);
+        }
+        Ok(())
+    }
+
+    /// Point every existing link at the program loaded by this process. XDP allows one program
+    /// per interface, so the kernel swaps it in place on the link; the interface is never left
+    /// unfiltered. The attach mode is part of the link and is kept.
+    fn replace_link_programs(&mut self) -> Result<()> {
+        let program: &mut Xdp = self
+            ._ebpf
+            .program_mut(PROGRAM)
+            .context("XDP object has no cidrwall program")?
+            .try_into()?;
+        let new_program = program.info()?.id();
+        for (ifindex, pinned) in std::mem::take(&mut self.links) {
+            let name = self.interfaces.get(&ifindex).map_or("?", String::as_str);
+            let link = FdLink::from(pinned);
+            let old_program = link.info()?.program_id();
+            let link = XdpLink::try_from(link)
+                .with_context(|| format!("owned link for ifindex {ifindex} is not an XDP link"))?;
+            let id = program
+                .attach_to_link(link)
+                .with_context(|| format!("replace XDP program on {name} (ifindex {ifindex})"))?;
+            drop(program.take_link(id)?);
+            let path = link_path(&self.config, ifindex);
+            let pinned = PinnedLink::from_pin(&path)
+                .with_context(|| format!("reopen XDP link {}", path.display()))?;
+            self.links.insert(ifindex, pinned);
+            log::info!(
+                "replaced XDP program: interface={name} ifindex={ifindex} program={old_program}->{new_program}"
+            );
         }
         Ok(())
     }
