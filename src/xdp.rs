@@ -14,6 +14,7 @@ use aya::{
     programs::{
         Xdp, XdpMode,
         links::{FdLink, PinnedLink},
+        xdp::XdpLink,
     },
 };
 use cidrwall_common::{Control, LAYOUT_VERSION, SLOT_COUNT};
@@ -123,6 +124,7 @@ impl XdpManager {
             counters,
             links,
         };
+        manager.replace_link_programs()?;
         manager.reconcile_links()?;
         Ok(manager)
     }
@@ -277,6 +279,37 @@ impl XdpManager {
                     .with_context(|| format!("attach XDP to {name} (ifindex {ifindex})"));
             }
             attached.push(ifindex);
+        }
+        Ok(())
+    }
+
+    /// Point every existing link at the program loaded by this process. XDP allows one program
+    /// per interface, so the kernel swaps it in place on the link; the interface is never left
+    /// unfiltered. The attach mode is part of the link and is kept.
+    fn replace_link_programs(&mut self) -> Result<()> {
+        let program: &mut Xdp = self
+            ._ebpf
+            .program_mut(PROGRAM)
+            .context("XDP object has no cidrwall program")?
+            .try_into()?;
+        let new_program = program.info()?.id();
+        for (ifindex, pinned) in std::mem::take(&mut self.links) {
+            let name = self.interfaces.get(&ifindex).map_or("?", String::as_str);
+            let link = FdLink::from(pinned);
+            let old_program = link.info()?.program_id();
+            let link = XdpLink::try_from(link)
+                .with_context(|| format!("owned link for ifindex {ifindex} is not an XDP link"))?;
+            let id = program
+                .attach_to_link(link)
+                .with_context(|| format!("replace XDP program on {name} (ifindex {ifindex})"))?;
+            drop(program.take_link(id)?);
+            let path = link_path(&self.config, ifindex);
+            let pinned = PinnedLink::from_pin(&path)
+                .with_context(|| format!("reopen XDP link {}", path.display()))?;
+            self.links.insert(ifindex, pinned);
+            log::info!(
+                "replaced XDP program: interface={name} ifindex={ifindex} program={old_program}->{new_program}"
+            );
         }
         Ok(())
     }

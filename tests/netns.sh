@@ -9,7 +9,7 @@ fi
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 BIN=${CIDRWALL_BIN:-$ROOT/target/debug/cidrwall}
 if [ "${CIDRWALL_MOUNT_NS:-0}" != "1" ]; then
-    exec unshare --mount --propagation private env CIDRWALL_MOUNT_NS=1 CIDRWALL_BIN="$BIN" "$0"
+    exec unshare --mount --propagation private env CIDRWALL_MOUNT_NS=1 "$0"
 fi
 TMP=$(mktemp -d /tmp/cidrwall-netns.XXXXXX)
 mkdir "$TMP/bpffs"
@@ -73,7 +73,16 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 cd "$ROOT"
-if [ -z "${CIDRWALL_BIN:-}" ]; then cargo build --locked; fi
+if [ -z "${CIDRWALL_BIN:-}" ]; then
+    # Under sudo, building as root would leave root-owned files in target/; require a fresh build.
+    if [ -z "${SUDO_USER:-}" ] && command -v cargo >/dev/null 2>&1; then
+        cargo build --locked
+    elif [ ! -x "$BIN" ] ||
+        [ -n "$(find Cargo.toml Cargo.lock build.rs src cidrwall-common cidrwall-ebpf -newer "$BIN" -print 2>/dev/null | head -n 1)" ]; then
+        echo "$BIN is missing or older than the sources; run cargo build first" >&2
+        exit 1
+    fi
+fi
 ip netns add "$ROUTER"
 ip netns add "$WAN"
 ip netns add "$LAN"
@@ -324,6 +333,39 @@ if [ -e "$TMP/bpffs/cidrwall" ]; then
     exit 1
 fi
 ip netns exec "$ROUTER" nft list table inet cidrwall >/dev/null
+ip netns exec "$ROUTER" nft delete table inet cidrwall
+
+# A restart swaps the running XDP program on the pinned link in place, keeping enforcement and counts.
+printf '%s\n' '192.0.2.2/32' >"$TMP/inbound.txt"
+sed 's/^cleanup_on_exit = true$/cleanup_on_exit = false/' "$TMP/xdp.toml" >"$TMP/xdp-keep.toml"
+ip netns exec "$ROUTER" "$BIN" --config "$TMP/xdp-keep.toml" >"$TMP/xdp-keep-log" 2>&1 &
+PID=$!
+wait_for_log "$TMP/xdp-keep-log" 'activated XDP blocklist: reason=startup' 'XDP keep startup'
+ip netns exec "$WAN" ping -c 1 -W 1 192.0.2.1 >/dev/null 2>&1 || true
+xdp_drops_before_restart=$(metric 'cidrwall_packets_total{backend="xdp",direction="inbound",interface="wan0",family="ipv4",verdict="drop"}')
+kill -TERM "$PID"
+wait "$PID"
+PID=""
+ip netns exec "$ROUTER" "$BIN" --config "$TMP/xdp-keep.toml" >"$TMP/xdp-restart-log" 2>&1 &
+PID=$!
+wait_for_log "$TMP/xdp-restart-log" 'activated XDP blocklist: reason=startup' 'XDP restart'
+replaced=$(sed -n 's/.*replaced XDP program: interface=wan0 .* program=\([0-9]*\)->\([0-9]*\).*/\1 \2/p' "$TMP/xdp-restart-log")
+set -- $replaced
+[ "$#" -eq 2 ] && [ "$1" != "$2" ] || {
+    cat "$TMP/xdp-restart-log" >&2
+    fail "XDP restart did not replace the program on the existing link"
+}
+if ip netns exec "$WAN" ping -c 1 -W 1 192.0.2.1 >/dev/null 2>&1; then
+    fail "XDP enforcement was lost during restart"
+fi
+xdp_drops_after_restart=$(metric 'cidrwall_packets_total{backend="xdp",direction="inbound",interface="wan0",family="ipv4",verdict="drop"}')
+[ -n "$xdp_drops_after_restart" ] && [ "$xdp_drops_after_restart" -gt "$xdp_drops_before_restart" ] ||
+    fail "pinned XDP counters did not survive restart ($xdp_drops_before_restart -> $xdp_drops_after_restart)"
+kill -TERM "$PID"
+wait "$PID"
+PID=""
+ip netns exec "$ROUTER" "$BIN" --config "$TMP/xdp-keep.toml" --cleanup xdp
+[ ! -e "$TMP/bpffs/cidrwall" ] || fail "XDP cleanup left pinned state behind"
 ip netns exec "$ROUTER" nft delete table inet cidrwall
 
 # TCX egress blocks both local and forwarded traffic and permits software flowtables.

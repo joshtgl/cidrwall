@@ -51,7 +51,10 @@ ingress_zones = ["WAN"]
 
 `auto` tries native/driver XDP first and falls back to generic/SKB XDP only when native mode is not
 supported. Missing interfaces fail startup. cidrwall will not replace a foreign XDP program, and
-requires a kernel with pinnable BPF links so attachments survive daemon restarts. Two configured
+requires a kernel with pinnable BPF links so attachments survive daemon restarts. On startup,
+cidrwall atomically swaps its current program onto existing links, so upgrades take effect without
+a gap in enforcement. A link keeps the mode it was created with; run `--cleanup xdp` after changing
+`mode` to re-create the links. Two configured
 LPM tries exist per address family, so capacity should account for both slots. The default is five
 million prefixes per map and can be reduced for smaller systems.
 
@@ -204,6 +207,7 @@ docker build -f Dockerfile.alpine -t cidrwall:alpine .
 cargo binstall bpf-linker@0.13.0
 rustup toolchain install "$(cat ebpf-toolchain)" --profile minimal --component rust-src
 cargo test
+cargo build
 sudo ./tests/netns.sh
 ```
 
