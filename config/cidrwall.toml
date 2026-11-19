@@ -41,7 +41,8 @@ cleanup_on_exit = false
 debounce_ms = 500
 reconcile_secs = 60
 
-# Uncomment to serve Prometheus metrics at http://127.0.0.1:9737/metrics.
+# Uncomment to serve Prometheus metrics at http://127.0.0.1:9737/metrics. `listen` takes one
+# address or a list, e.g. ["127.0.0.1:9737", "[::1]:9737"]; "[::]:9737" is dual-stack.
 # [metrics]
 # listen = "127.0.0.1:9737"
 

@@ -162,8 +162,16 @@ tables or pinned maps.
 ## Metrics
 
 cidrwall can serve Prometheus metrics at `/metrics`. The listener is disabled by default; enable it
-with `[metrics] listen = "127.0.0.1:9737"` or `--metrics-listen` / `CIDRWALL_METRICS_LISTEN`. The
-endpoint has no authentication, so keep it on loopback unless a firewall restricts who can reach it.
+with `[metrics] listen = "127.0.0.1:9737"` or `--metrics-listen` / `CIDRWALL_METRICS_LISTEN`.
+`listen` also accepts a list such as `["127.0.0.1:9737", "[::1]:9737"]`; the flag can be repeated
+and both the flag and the environment variable accept comma-separated addresses. IPv6 addresses are
+bracketed, and `[::]:9737` listens dual-stack unless `net.ipv6.bindv6only` is set. The endpoint has
+no authentication, so keep it on loopback unless a firewall restricts who can reach it.
+
+A listen address that cannot be bound never stops cidrwall from enforcing blocklists. Each address
+is bound on its own thread and retried in the background, backing off from one second to one minute,
+so an address assigned after startup is picked up once it appears. The first failure, and any
+change in the error, is logged as a warning.
 Packet counters are read from the kernel when a scrape arrives.
 
 | Metric | Labels | Meaning |

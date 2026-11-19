@@ -41,6 +41,7 @@ wait_for_log() {
     done
 }
 METRICS="127.0.0.1:9737"
+METRICS_V6="[::1]:9737"
 # Print the value of one exact series from the router's metrics endpoint.
 metric() {
     ip netns exec "$ROUTER" curl -sf "http://$METRICS/metrics" |
@@ -148,7 +149,7 @@ outbound = "$TMP/outbound.txt"
 allow_flowtable_bypass = false
 populate_batch_elements = 2
 [metrics]
-listen = "$METRICS"
+listen = ["$METRICS", "$METRICS_V6"]
 [[rules.input]]
 blocklist = "inbound"
 ingress_zones = ["WAN"]
@@ -192,6 +193,8 @@ expect_metric_positive 'cidrwall_packets_total{backend="nftables",direction="out
     "nftables outbound drops were not counted"
 expect_metric_positive 'cidrwall_last_apply_success_timestamp_seconds{backend="nftables",direction="inbound"}' \
     "nftables startup apply was not recorded"
+ip netns exec "$ROUTER" curl -sf "http://$METRICS_V6/metrics" | grep -q '^cidrwall_build_info' ||
+    fail "metrics were not served on the second (IPv6) listen address"
 ip netns exec "$ROUTER" nft list counters table inet cidrwall | grep -q 'counter inbound_ipv4_drops' ||
     fail "named nftables drop counter is missing"
 drops_before_reload=$(metric 'cidrwall_packets_total{backend="nftables",direction="inbound",interface="",family="ipv4",verdict="drop"}')

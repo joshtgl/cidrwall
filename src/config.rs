@@ -1,8 +1,9 @@
 use crate::zones::{ResolvedRule, Zones};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::{
+    collections::BTreeSet,
     net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
@@ -35,8 +36,9 @@ pub struct Cli {
     pub allow_flowtable_bypass: Option<bool>,
     #[arg(long, env = "CIDRWALL_POPULATE_BATCH_ELEMENTS")]
     pub populate_batch_elements: Option<u32>,
-    #[arg(long, env = "CIDRWALL_METRICS_LISTEN")]
-    pub metrics_listen: Option<SocketAddr>,
+    /// Repeat or comma-separate to listen on several addresses.
+    #[arg(long, env = "CIDRWALL_METRICS_LISTEN", value_delimiter = ',')]
+    pub metrics_listen: Vec<SocketAddr>,
     #[arg(long, help = "Validate configuration and print the resolved rules")]
     pub check: bool,
     #[arg(
@@ -218,8 +220,23 @@ impl Default for Runtime {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Metrics {
-    /// Address for the Prometheus `/metrics` listener; disabled when unset.
-    pub listen: Option<SocketAddr>,
+    /// Addresses for the Prometheus `/metrics` listener, as one address or a list; disabled when
+    /// empty.
+    #[serde(deserialize_with = "one_or_many")]
+    pub listen: Vec<SocketAddr>,
+}
+
+fn one_or_many<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<SocketAddr>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(SocketAddr),
+        Many(Vec<SocketAddr>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(address) => vec![address],
+        OneOrMany::Many(addresses) => addresses,
+    })
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -281,8 +298,8 @@ impl Config {
         if let Some(v) = cli.populate_batch_elements {
             value.nftables.populate_batch_elements = v;
         }
-        if let Some(v) = cli.metrics_listen {
-            value.metrics.listen = Some(v);
+        if !cli.metrics_listen.is_empty() {
+            value.metrics.listen.clone_from(&cli.metrics_listen);
         }
         value.validate(cli.cleanup.is_some())?;
         Ok(value)
@@ -306,6 +323,15 @@ impl Config {
         }
         if self.nftables.populate_batch_elements == 0 {
             bail!("populate_batch_elements must be non-zero")
+        }
+        let mut listen = BTreeSet::new();
+        if let Some(address) = self
+            .metrics
+            .listen
+            .iter()
+            .find(|address| !listen.insert(*address))
+        {
+            bail!("metrics.listen contains {address} more than once")
         }
         if self.xdp.ipv4_max_entries == 0
             || self.xdp.ipv6_max_entries == 0
@@ -573,6 +599,47 @@ ingress_zones = ["WAN"]
     }
 
     #[test]
+    fn metrics_listen_accepts_one_address_or_a_list() {
+        let one: Config = toml::from_str(&format!(
+            "{INLINE_CONFIG}\n[metrics]\nlisten = \"127.0.0.1:9737\"\n"
+        ))
+        .unwrap();
+        assert_eq!(one.metrics.listen, ["127.0.0.1:9737".parse().unwrap()]);
+
+        let many: Config = toml::from_str(&format!(
+            "{INLINE_CONFIG}\n[metrics]\nlisten = [\"127.0.0.1:9737\", \"[::1]:9737\"]\n"
+        ))
+        .unwrap();
+        many.validate(false).unwrap();
+        assert_eq!(
+            many.metrics.listen,
+            [
+                "127.0.0.1:9737".parse::<SocketAddr>().unwrap(),
+                "[::1]:9737".parse().unwrap()
+            ]
+        );
+
+        let duplicate: Config = toml::from_str(&format!(
+            "{INLINE_CONFIG}\n[metrics]\nlisten = [\"[::1]:9737\", \"[::1]:9737\"]\n"
+        ))
+        .unwrap();
+        assert!(duplicate.validate(false).is_err());
+    }
+
+    #[test]
+    fn metrics_listen_flag_splits_on_commas() {
+        let cli = Cli::try_parse_from([
+            "cidrwall",
+            "--metrics-listen",
+            "127.0.0.1:9737,[::1]:9737",
+            "--metrics-listen",
+            "10.0.0.1:9737",
+        ])
+        .unwrap();
+        assert_eq!(cli.metrics_listen.len(), 3);
+    }
+
+    #[test]
     fn explicit_zones_path_overrides_inline_zones() {
         let root = tempfile::tempdir().unwrap();
         let config_path = root.path().join("cidrwall.toml");
@@ -590,7 +657,7 @@ ingress_zones = ["WAN"]
             reconcile_secs: None,
             allow_flowtable_bypass: None,
             populate_batch_elements: None,
-            metrics_listen: None,
+            metrics_listen: Vec::new(),
             check: false,
             cleanup: None,
         };

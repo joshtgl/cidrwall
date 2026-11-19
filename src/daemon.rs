@@ -124,9 +124,7 @@ impl<B: Backend> Daemon<B> {
     }
 
     pub fn start(mut self) -> Result<()> {
-        if let Some(address) = self.config.metrics.listen {
-            metrics::spawn(address, self.config.clone(), self.metrics.clone())?;
-        }
+        metrics::spawn(&self.config.metrics.listen, &self.config, &self.metrics)?;
         let result = self.initial_load().and_then(|()| self.watch());
         let mut cleanup_errors = Vec::new();
         #[cfg(feature = "xdp")]

@@ -12,10 +12,14 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const IO_TIMEOUT: Duration = Duration::from_secs(2);
+/// Budget for reading a whole request, and separately for writing the whole response.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const BIND_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const BIND_RETRY_MAX: Duration = Duration::from_secs(60);
+const ACCEPT_ERROR_DELAY: Duration = Duration::from_millis(100);
 const MAX_REQUEST_BYTES: u64 = 8192;
 const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -126,26 +130,112 @@ struct PacketSample {
 }
 
 /// Bind the listener and serve scrapes on a background thread.
-pub fn spawn(address: SocketAddr, config: Config, metrics: Metrics) -> Result<()> {
-    let listener =
-        TcpListener::bind(address).with_context(|| format!("bind metrics listener {address}"))?;
+/// Start one listener thread per address. Binding happens on that thread and is retried with
+/// backoff, so an address that is not yet available never blocks or fails blocklist enforcement.
+pub fn spawn(addresses: &[SocketAddr], config: &Config, metrics: &Metrics) -> Result<()> {
+    for &address in addresses {
+        let config = config.clone();
+        let metrics = metrics.clone();
+        thread::Builder::new()
+            .name("metrics".into())
+            .spawn(move || listen(address, &config, &metrics, BIND_RETRY_INITIAL))
+            .with_context(|| format!("spawn metrics listener thread for {address}"))?;
+    }
+    Ok(())
+}
+
+fn listen(address: SocketAddr, config: &Config, metrics: &Metrics, retry: Duration) {
+    let listener = bind_with_retry(address, retry);
     log::info!("metrics listener started: address={address} path=/metrics");
-    thread::Builder::new()
-        .name("metrics".into())
-        .spawn(move || {
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => {
-                        if let Err(error) = serve(stream, &config, &metrics) {
-                            log::debug!("metrics request failed: {error}");
-                        }
-                    }
-                    Err(error) => log::warn!("metrics listener accept failed: {error}"),
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                if let Err(error) = serve(stream, config, metrics) {
+                    log::debug!("metrics request failed: address={address}: {error}");
                 }
             }
-        })
-        .context("spawn metrics listener thread")?;
-    Ok(())
+            Err(error) => {
+                log::warn!("metrics listener accept failed: address={address}: {error}");
+                // Errors such as EMFILE persist briefly; avoid spinning on them.
+                thread::sleep(ACCEPT_ERROR_DELAY);
+            }
+        }
+    }
+}
+
+/// Bind `address`, doubling the delay between attempts up to `BIND_RETRY_MAX`. A failure is
+/// logged as a warning when first seen or when the error changes; repeats are logged at debug.
+fn bind_with_retry(address: SocketAddr, initial: Duration) -> TcpListener {
+    let mut delay = initial;
+    let mut last_error = None;
+    loop {
+        match TcpListener::bind(address) {
+            Ok(listener) => return listener,
+            Err(error) => {
+                let message = error.to_string();
+                if last_error.as_ref() == Some(&message) {
+                    log::debug!(
+                        "metrics listener bind failed: address={address} retry_in={delay:?}: {error}"
+                    );
+                } else {
+                    log::warn!(
+                        "metrics listener bind failed; retrying in the background: address={address} retry_in={delay:?}: {error}"
+                    );
+                    last_error = Some(message);
+                }
+                thread::sleep(delay);
+                delay = delay.saturating_mul(2).min(BIND_RETRY_MAX);
+            }
+        }
+    }
+}
+
+/// Socket I/O bounded by one deadline across every call, so a client trickling bytes cannot hold
+/// a listener thread longer than the deadline.
+struct Deadline<'a> {
+    stream: &'a TcpStream,
+    deadline: Instant,
+}
+
+impl<'a> Deadline<'a> {
+    fn new(stream: &'a TcpStream, budget: Duration) -> Self {
+        Self {
+            stream,
+            deadline: Instant::now() + budget,
+        }
+    }
+
+    fn remaining(&self) -> io::Result<Duration> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "metrics request deadline exceeded",
+            ));
+        }
+        Ok(remaining)
+    }
+}
+
+impl Read for Deadline<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        let mut stream = self.stream;
+        stream.read(buffer)
+    }
+}
+
+impl Write for Deadline<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        let mut stream = self.stream;
+        stream.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut stream = self.stream;
+        stream.flush()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -175,9 +265,8 @@ fn route(request_line: &str) -> Route {
 }
 
 fn serve(stream: TcpStream, config: &Config, metrics: &Metrics) -> io::Result<()> {
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    let mut reader = BufReader::new((&stream).take(MAX_REQUEST_BYTES));
+    let mut reader =
+        BufReader::new(Deadline::new(&stream, REQUEST_TIMEOUT).take(MAX_REQUEST_BYTES));
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
     // Drain headers so closing the socket does not reset the connection before the reply lands.
@@ -195,7 +284,7 @@ fn serve(stream: TcpStream, config: &Config, metrics: &Metrics) -> io::Result<()
         ),
         Route::BadRequest => ("400 Bad Request", "text/plain", "bad request\n".into()),
     };
-    let mut stream = &stream;
+    let mut stream = Deadline::new(&stream, REQUEST_TIMEOUT);
     write!(
         stream,
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -504,6 +593,85 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
+
+    fn test_config() -> Config {
+        toml::from_str(
+            r#"
+[zones]
+WAN = ["eth0"]
+[[rules.input]]
+blocklist = "inbound"
+ingress_zones = ["WAN"]
+"#,
+        )
+        .unwrap()
+    }
+
+    fn get(address: SocketAddr, path: &str) -> io::Result<String> {
+        let mut stream = TcpStream::connect(address)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        write!(stream, "GET {path} HTTP/1.1\r\nHost: test\r\n\r\n")?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        Ok(response)
+    }
+
+    #[test]
+    fn listener_binds_once_the_address_is_released() {
+        let blocker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = blocker.local_addr().unwrap();
+        let config = test_config();
+        let metrics = Metrics::default();
+        thread::spawn(move || listen(address, &config, &metrics, Duration::from_millis(20)));
+
+        // The listener keeps retrying while the port is taken; the blocker answers nothing.
+        thread::sleep(Duration::from_millis(100));
+        drop(blocker);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let response = loop {
+            match get(address, "/missing") {
+                Ok(response) => break response,
+                Err(error) if Instant::now() < deadline => {
+                    let _ = error;
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("listener never bound {address}: {error}"),
+            }
+        };
+        assert!(response.starts_with("HTTP/1.1 404 "), "{response}");
+    }
+
+    #[test]
+    fn deadline_bounds_a_trickling_request() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            for _ in 0..50 {
+                if stream.write_all(b"G").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let started = Instant::now();
+        let mut reader = BufReader::new(Deadline::new(&stream, Duration::from_millis(200)));
+        let error = reader.read_line(&mut String::new()).unwrap_err();
+        // A socket timeout surfaces as WouldBlock; an expired deadline before a read as TimedOut.
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(600));
+        drop(stream);
+        client.join().unwrap();
+    }
 
     #[test]
     fn routes_only_get_metrics() {
