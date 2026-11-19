@@ -10,6 +10,8 @@ let
   settingsFormat = pkgs.formats.toml { };
   configFile = settingsFormat.generate "cidrwall.toml" cfg.settings;
   usesBpf = (cfg.settings.xdp.rules or [ ]) != [ ] || (cfg.settings.tc.rules or [ ]) != [ ];
+  # `listen` is one address or a list of them.
+  metricsListen = lib.toList (cfg.settings.metrics.listen or [ ]);
 in
 {
   options.services.cidrwall = {
@@ -100,6 +102,11 @@ in
         RestrictAddressFamilies = [
           "AF_NETLINK"
           "AF_UNIX"
+        ]
+        # The /metrics listener.
+        ++ lib.optionals (metricsListen != [ ]) [
+          "AF_INET"
+          "AF_INET6"
         ];
         RestrictNamespaces = true;
         RestrictRealtime = true;
