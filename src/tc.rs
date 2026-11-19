@@ -1,6 +1,8 @@
 use crate::{
     blocklist::{self, AddressPrefix},
     config::{Config, Direction, Tc as TcConfig, TcAttachOrder, open_blocklist},
+    counters::{COUNTERS, COUNTERS_UNKNOWN, CounterMaps},
+    metrics::ApplyStats,
 };
 use anyhow::{Context, Result, bail};
 use aya::{
@@ -27,7 +29,15 @@ const IPV4_A: &str = "IPV4_A";
 const IPV4_B: &str = "IPV4_B";
 const IPV6_A: &str = "IPV6_A";
 const IPV6_B: &str = "IPV6_B";
-const MAP_NAMES: [&str; 5] = [CONTROL, IPV4_A, IPV4_B, IPV6_A, IPV6_B];
+const MAP_NAMES: [&str; 7] = [
+    CONTROL,
+    IPV4_A,
+    IPV4_B,
+    IPV6_A,
+    IPV6_B,
+    COUNTERS,
+    COUNTERS_UNKNOWN,
+];
 const PROGRAM: &str = "cidrwall_tc";
 const OBJECT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cidrwall-tc"));
 
@@ -44,6 +54,7 @@ pub struct TcManager {
     ipv4_b: V4Trie,
     ipv6_a: V6Trie,
     ipv6_b: V6Trie,
+    counters: CounterMaps,
     links: BTreeMap<u32, PinnedLink>,
 }
 
@@ -92,6 +103,7 @@ impl TcManager {
         let ipv4_b = take_v4(&mut ebpf, IPV4_B)?;
         let ipv6_a = take_v6(&mut ebpf, IPV6_A)?;
         let ipv6_b = take_v6(&mut ebpf, IPV6_B)?;
+        let counters = CounterMaps::take(&mut ebpf, "TC")?;
 
         let program: &mut SchedClassifier = ebpf
             .program_mut(PROGRAM)
@@ -109,6 +121,7 @@ impl TcManager {
             ipv4_b,
             ipv6_a,
             ipv6_b,
+            counters,
             links: BTreeMap::new(),
         })
     }
@@ -117,7 +130,7 @@ impl TcManager {
         self.replace_startup_links()
     }
 
-    pub fn reload(&mut self, config: &Config, reason: &str) -> Result<()> {
+    pub fn reload(&mut self, config: &Config, reason: &str) -> Result<ApplyStats> {
         let active = self.control.get(&0, 0)?.active_slot;
         let inactive = 1 - active;
         self.clear_slot(inactive)?;
@@ -174,12 +187,16 @@ impl TcManager {
                 Ok(())
             },
         );
-        if let Err(error) = result {
-            if let Err(clear) = self.clear_slot(inactive) {
-                log::error!("failed to clear rejected TC staging slot: {clear:#}");
+        let stats = match result {
+            Ok(stats) => stats,
+            Err(error) => {
+                if let Err(clear) = self.clear_slot(inactive) {
+                    log::error!("failed to clear rejected TC staging slot: {clear:#}");
+                }
+                return Err(error)
+                    .with_context(|| format!("stage TC blocklist {}", path.display()));
             }
-            return Err(error).with_context(|| format!("stage TC blocklist {}", path.display()));
-        }
+        };
 
         self.control.set(
             0,
@@ -196,7 +213,16 @@ impl TcManager {
             "activated TC blocklist: reason={reason} path={} ipv4_prefixes={ipv4} ipv6_prefixes={ipv6} slot={inactive}",
             path.display()
         );
-        Ok(())
+        Ok(ApplyStats {
+            ipv4_prefixes: ipv4,
+            ipv6_prefixes: ipv6,
+            source_cidrs: stats.cidrs,
+            slot: inactive,
+        })
+    }
+
+    pub fn interfaces(&self) -> &BTreeMap<u32, String> {
+        &self.interfaces
     }
 
     pub fn reconcile(&mut self) -> Result<()> {
@@ -217,6 +243,8 @@ impl TcManager {
             }
         }
         self.interfaces = current;
+        self.counters
+            .sync(&self.interfaces.keys().copied().collect());
         self.attach_missing_links()
     }
 
@@ -244,6 +272,7 @@ impl TcManager {
 
     fn replace_startup_links(&mut self) -> Result<()> {
         let desired: BTreeSet<_> = self.interfaces.keys().copied().collect();
+        self.counters.sync(&desired);
         for entry in fs::read_dir(link_dir(&self.config))? {
             let path = entry?.path();
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {

@@ -27,6 +27,8 @@ use std::{
 const NFT_MSG_GETFLOWTABLE: u16 = 23;
 const NFT_MSG_GETTABLE: u16 = 1;
 const NFT_MSG_GETSET: u16 = 10;
+const NFT_MSG_GETOBJ: u16 = 19;
+const NFT_OBJECT_COUNTER: u32 = 1;
 const NFT_FLOWTABLE_HW_OFFLOAD: u32 = 1;
 const MAX_FLOWTABLE_DEVICES: usize = 4096;
 
@@ -232,6 +234,156 @@ impl Expression for NamedLookup {
             );
         }
         expression
+    }
+}
+
+/// Reference to a named counter object, which keeps its value when the rule is replaced.
+pub(super) struct NamedCounter(CString);
+
+impl NamedCounter {
+    pub(super) fn new(name: &CStr) -> Self {
+        Self(name.to_owned())
+    }
+}
+
+impl Expression for NamedCounter {
+    fn to_expr(&self, _rule: &Rule) -> NonNull<sys::nftnl_expr> {
+        // SAFETY: allocation has no preconditions.
+        let expression = unsafe { sys::nftnl_expr_alloc(c"objref".as_ptr()) };
+        let expression = NonNull::new(expression).unwrap_or_else(|| std::process::abort());
+        // SAFETY: the expression is live and uniquely owned; this selects the object type.
+        unsafe {
+            sys::nftnl_expr_set_u32(
+                expression.as_ptr(),
+                sys::NFTNL_EXPR_OBJREF_IMM_TYPE as u16,
+                NFT_OBJECT_COUNTER,
+            );
+        }
+        // SAFETY: the expression and name are live, and libnftnl copies the name.
+        unsafe {
+            sys::nftnl_expr_set_str(
+                expression.as_ptr(),
+                sys::NFTNL_EXPR_OBJREF_IMM_NAME as u16,
+                self.0.as_ptr(),
+            );
+        }
+        expression
+    }
+}
+
+/// Creates a named counter object. Without `NLM_F_EXCL` an existing counter is left untouched,
+/// so adding it in every transaction that references it is safe and preserves its value.
+pub(super) struct CounterObject<'table> {
+    table: &'table Table,
+    name: CString,
+}
+
+impl<'table> CounterObject<'table> {
+    pub(super) fn new(name: &CStr, table: &'table Table) -> Self {
+        Self {
+            table,
+            name: name.to_owned(),
+        }
+    }
+}
+
+// SAFETY: serialization writes one bounded object-create message and all borrowed objects outlive
+// it.
+#[allow(clippy::multiple_unsafe_ops_per_block)]
+unsafe impl NlMsg for CounterObject<'_> {
+    unsafe fn write(&self, buffer: *mut c_void, seq: u32, _msg_type: MsgType) {
+        // SAFETY: allocation has no preconditions and is checked before use.
+        let object = unsafe { sys::nftnl_obj_alloc() };
+        if object.is_null() {
+            std::process::abort();
+        }
+        // SAFETY: `object` is live and uniquely owned, libnftnl copies the strings, and the NlMsg
+        // contract provides a sufficiently large output buffer.
+        unsafe {
+            sys::nftnl_obj_set_u32(
+                object,
+                sys::NFTNL_OBJ_FAMILY as u16,
+                self.table.get_family() as u32,
+            );
+            sys::nftnl_obj_set_str(
+                object,
+                sys::NFTNL_OBJ_TABLE as u16,
+                self.table.get_name().as_ptr(),
+            );
+            sys::nftnl_obj_set_str(object, sys::NFTNL_OBJ_NAME as u16, self.name.as_ptr());
+            sys::nftnl_obj_set_u32(object, sys::NFTNL_OBJ_TYPE as u16, NFT_OBJECT_COUNTER);
+            sys::nftnl_obj_set_u64(object, sys::NFTNL_OBJ_CTR_PKTS as u16, 0);
+            sys::nftnl_obj_set_u64(object, sys::NFTNL_OBJ_CTR_BYTES as u16, 0);
+            let header = sys::nftnl_nlmsg_build_hdr(
+                buffer.cast::<c_char>(),
+                libc::NFT_MSG_NEWOBJ as u16,
+                ProtoFamily::Inet as u16,
+                (libc::NLM_F_CREATE | libc::NLM_F_ACK) as u16,
+                seq,
+            );
+            sys::nftnl_obj_nlmsg_build_payload(header, object);
+            sys::nftnl_obj_free(object);
+        }
+    }
+}
+
+struct FreeObject;
+// SAFETY: `nftnl_obj_free` matches pointers returned by `nftnl_obj_alloc`.
+unsafe impl Deallocator<sys::nftnl_obj> for FreeObject {
+    unsafe fn deallocate(&mut self, pointer: NonNull<sys::nftnl_obj>) {
+        // SAFETY: guaranteed by the Deallocator contract.
+        unsafe { sys::nftnl_obj_free(pointer.as_ptr()) };
+    }
+}
+
+/// A named counter object parsed from a GETOBJ dump.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CounterInfo {
+    pub(super) table: String,
+    pub(super) name: String,
+    pub(super) packets: u64,
+    pub(super) bytes: u64,
+}
+
+impl CounterInfo {
+    /// Returns `None` for objects that are not counters.
+    pub(super) fn parse(message: &libc::nlmsghdr) -> io::Result<Option<Self>> {
+        // SAFETY: allocation has no preconditions.
+        let pointer = unsafe { sys::nftnl_obj_alloc() };
+        // SAFETY: a non-null pointer is uniquely owned and paired with FreeObject.
+        let object = unsafe { OwnedPtr::from_alloc(pointer, FreeObject, "object") }?;
+        let raw = object.pointer().as_ptr();
+        // SAFETY: the netlink message and destination object are live and bounded.
+        if unsafe { sys::nftnl_obj_nlmsg_parse(message, raw) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the parsed object remains live for this attribute lookup.
+        if unsafe { sys::nftnl_obj_get_u32(raw, sys::NFTNL_OBJ_TYPE as u16) } != NFT_OBJECT_COUNTER
+        {
+            return Ok(None);
+        }
+        let string = |attr: u32, label: &'static str| -> io::Result<String> {
+            // SAFETY: the parsed object remains live for this borrowed attribute lookup.
+            let value = unsafe { sys::nftnl_obj_get_str(raw, attr as u16) };
+            if value.is_null() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("object has no {label}"),
+                ));
+            }
+            // SAFETY: libnftnl returns a NUL-terminated string owned by the live object.
+            Ok(unsafe { CStr::from_ptr(value) }
+                .to_string_lossy()
+                .into_owned())
+        };
+        Ok(Some(Self {
+            table: string(sys::NFTNL_OBJ_TABLE, "table")?,
+            name: string(sys::NFTNL_OBJ_NAME, "name")?,
+            // SAFETY: the parsed object remains live for these attribute lookups.
+            packets: unsafe { sys::nftnl_obj_get_u64(raw, sys::NFTNL_OBJ_CTR_PKTS as u16) },
+            // SAFETY: as above.
+            bytes: unsafe { sys::nftnl_obj_get_u64(raw, sys::NFTNL_OBJ_CTR_BYTES as u16) },
+        }))
     }
 }
 
@@ -651,6 +803,9 @@ impl NetlinkRequest {
     }
     pub(super) fn set_dump(seq: u32) -> io::Result<Self> {
         Self::dump(NFT_MSG_GETSET, seq)
+    }
+    pub(super) fn object_dump(seq: u32) -> io::Result<Self> {
+        Self::dump(NFT_MSG_GETOBJ, seq)
     }
 
     pub(super) fn flowtable_dump(seq: u32) -> io::Result<Self> {
@@ -1563,6 +1718,69 @@ mod tests {
         // SAFETY: The iterator and its underlying parsed rule remain live.
         let next = unsafe { sys::nftnl_expr_iter_next(iterator.pointer().as_ptr()) };
         assert!(next.is_null());
+    }
+
+    #[test]
+    fn named_counter_round_trips_as_a_counter_objref() {
+        let table = Table::new(c"roundtrip", ProtoFamily::Inet);
+        let chain = Chain::new(c"input", &table);
+        let mut source = Rule::new(&chain);
+        source.add_expr(&NamedCounter::new(c"inbound_ipv4_drops"));
+        let message = serialize(&source, MsgType::Add, 76);
+        let parsed = allocate_test_rule();
+        parse_rule(&parsed, &message);
+
+        // SAFETY: The parsed rule remains live for the iterator's lifetime.
+        let iterator = unsafe { sys::nftnl_expr_iter_create(parsed.pointer().as_ptr()) };
+        // SAFETY: A non-null result is uniquely owned and paired with the iterator destroy call.
+        let iterator = unsafe {
+            OwnedPtr::from_alloc(iterator, FreeExpressionIterator, "test expression iterator")
+        }
+        .unwrap();
+        // SAFETY: The iterator and its underlying parsed rule are live.
+        let expression = unsafe { sys::nftnl_expr_iter_next(iterator.pointer().as_ptr()) };
+        let expression = NonNull::new(expression).expect("objref expression is missing");
+        // SAFETY: The expression is live for this attribute lookup.
+        let object_type = unsafe {
+            sys::nftnl_expr_get_u32(expression.as_ptr(), sys::NFTNL_EXPR_OBJREF_IMM_TYPE as u16)
+        };
+        assert_eq!(object_type, NFT_OBJECT_COUNTER);
+        // SAFETY: The expression is live for this attribute lookup.
+        let name = unsafe {
+            sys::nftnl_expr_get_str(expression.as_ptr(), sys::NFTNL_EXPR_OBJREF_IMM_NAME as u16)
+        };
+        assert!(!name.is_null());
+        // SAFETY: libnftnl returned a NUL-terminated string owned by the live expression.
+        assert_eq!(unsafe { CStr::from_ptr(name) }, c"inbound_ipv4_drops");
+    }
+
+    #[test]
+    fn counter_object_creates_without_exclusive_and_parses_back() {
+        let table = Table::new(c"roundtrip", ProtoFamily::Inet);
+        let object = CounterObject::new(c"outbound_ipv6_drops", &table);
+        let message = serialize(&object, MsgType::Add, 77);
+        let message_header = header(message.as_bytes());
+        assert_eq!(
+            message_header.nlmsg_type,
+            nft_message_type(libc::NFT_MSG_NEWOBJ as u16)
+        );
+        assert_eq!(
+            message_header.nlmsg_flags,
+            (libc::NLM_F_REQUEST | libc::NLM_F_CREATE | libc::NLM_F_ACK) as u16,
+            "an existing counter must be kept rather than rejected or reset"
+        );
+        let parsed = CounterInfo::parse(message_header)
+            .unwrap()
+            .expect("counter object");
+        assert_eq!(
+            parsed,
+            CounterInfo {
+                table: "roundtrip".into(),
+                name: "outbound_ipv6_drops".into(),
+                packets: 0,
+                bytes: 0,
+            }
+        );
     }
 
     #[test]

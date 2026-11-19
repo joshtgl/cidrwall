@@ -3,6 +3,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 use std::{
+    net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -34,6 +35,8 @@ pub struct Cli {
     pub allow_flowtable_bypass: Option<bool>,
     #[arg(long, env = "CIDRWALL_POPULATE_BATCH_ELEMENTS")]
     pub populate_batch_elements: Option<u32>,
+    #[arg(long, env = "CIDRWALL_METRICS_LISTEN")]
+    pub metrics_listen: Option<SocketAddr>,
     #[arg(long, help = "Validate configuration and print the resolved rules")]
     pub check: bool,
     #[arg(
@@ -68,6 +71,8 @@ pub struct Config {
     pub tc: Tc,
     #[serde(default)]
     pub runtime: Runtime,
+    #[serde(default)]
+    pub metrics: Metrics,
     #[serde(default)]
     pub rules: Rules,
 }
@@ -212,6 +217,13 @@ impl Default for Runtime {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct Metrics {
+    /// Address for the Prometheus `/metrics` listener; disabled when unset.
+    pub listen: Option<SocketAddr>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Rules {
     pub input: Vec<RuleMapping>,
     pub forward: Vec<RuleMapping>,
@@ -268,6 +280,9 @@ impl Config {
         }
         if let Some(v) = cli.populate_batch_elements {
             value.nftables.populate_batch_elements = v;
+        }
+        if let Some(v) = cli.metrics_listen {
+            value.metrics.listen = Some(v);
         }
         value.validate(cli.cleanup.is_some())?;
         Ok(value)
@@ -575,6 +590,7 @@ ingress_zones = ["WAN"]
             reconcile_secs: None,
             allow_flowtable_bypass: None,
             populate_batch_elements: None,
+            metrics_listen: None,
             check: false,
             cleanup: None,
         };
