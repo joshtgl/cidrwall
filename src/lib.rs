@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod metrics;
 pub mod netlink;
 pub mod rules;
+pub mod status;
 #[cfg(feature = "tc")]
 pub mod tc;
 #[cfg(feature = "xdp")]

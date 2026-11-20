@@ -46,6 +46,11 @@ reconcile_secs = 60
 # [metrics]
 # listen = "127.0.0.1:9737"
 
+# Uncomment to write the same state as JSON every `interval_secs`, for local status tools.
+# [status]
+# file = "/run/cidrwall/status.json"
+# interval_secs = 5
+
 [[xdp.rules]]
 blocklist = "inbound"
 ingress_zones = ["WAN"]

@@ -194,6 +194,44 @@ entry. Their counters live in pinned per-CPU maps, so they survive daemon restar
 (`inbound_ipv4_drops`, `outbound_ipv6_drops`, …) that keep their values across reloads; its series
 have `interface=""` because one rule covers every protected interface.
 
+## Status file
+
+For local readers such as health checks, cidrwall can also write its state as JSON, with no
+listener: `[status] file = "/run/cidrwall/status.json"` (or `--status-file` /
+`CIDRWALL_STATUS_FILE`). It is replaced atomically every `interval_secs` (default 5), so a reader
+can tell a stuck daemon by `updated`. The NixOS module creates `/run/cidrwall` for a file there.
+
+```json
+{
+  "version": 1,
+  "updated": 1795131877,
+  "enforcement": [
+    {
+      "backend": "xdp",
+      "direction": "inbound",
+      "interfaces": ["wan0"],
+      "ipv4Prefixes": 3479555,
+      "ipv6Prefixes": 37676,
+      "sourceCidrs": 3517231,
+      "activeSlot": 1,
+      "lastSuccess": 1795131837,
+      "lastApplyOk": true,
+      "applyFailures": 0,
+      "dropped": { "packets": 1204, "bytes": 72240 },
+      "passed": { "packets": 9921340, "bytes": 8120339120 }
+    }
+  ],
+  "reconcileFailures": 0,
+  "counterErrors": []
+}
+```
+
+There is one `enforcement` entry per backend and direction, with the same values as the metrics of
+that name; packet counters are summed over interfaces and families. `lastApplyOk` is false until
+the first apply, and `passed` is null for nftables, which counts drops only. `counterErrors` names
+the backends whose counters could not be read for this snapshot. `version` changes only when a
+field changes meaning or goes away.
+
 ## Container
 
 The container needs the host network namespace, `CAP_NET_ADMIN`, and `CAP_BPF` for XDP or TCX on

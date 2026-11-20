@@ -39,6 +39,9 @@ pub struct Cli {
     /// Repeat or comma-separate to listen on several addresses.
     #[arg(long, env = "CIDRWALL_METRICS_LISTEN", value_delimiter = ',')]
     pub metrics_listen: Vec<SocketAddr>,
+    /// Write a JSON status file here.
+    #[arg(long, env = "CIDRWALL_STATUS_FILE")]
+    pub status_file: Option<PathBuf>,
     #[arg(long, help = "Validate configuration and print the resolved rules")]
     pub check: bool,
     #[arg(
@@ -75,6 +78,8 @@ pub struct Config {
     pub runtime: Runtime,
     #[serde(default)]
     pub metrics: Metrics,
+    #[serde(default)]
+    pub status: Status,
     #[serde(default)]
     pub rules: Rules,
 }
@@ -226,6 +231,22 @@ pub struct Metrics {
     pub listen: Vec<SocketAddr>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Status {
+    /// JSON status file, rewritten every `interval_secs`; disabled when unset.
+    pub file: Option<PathBuf>,
+    pub interval_secs: u64,
+}
+impl Default for Status {
+    fn default() -> Self {
+        Self {
+            file: None,
+            interval_secs: 5,
+        }
+    }
+}
+
 fn one_or_many<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<SocketAddr>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
@@ -301,6 +322,9 @@ impl Config {
         if !cli.metrics_listen.is_empty() {
             value.metrics.listen.clone_from(&cli.metrics_listen);
         }
+        if let Some(file) = &cli.status_file {
+            value.status.file = Some(file.clone());
+        }
         value.validate(cli.cleanup.is_some())?;
         Ok(value)
     }
@@ -332,6 +356,17 @@ impl Config {
             .find(|address| !listen.insert(*address))
         {
             bail!("metrics.listen contains {address} more than once")
+        }
+        if self
+            .status
+            .file
+            .as_ref()
+            .is_some_and(|file| !file.is_absolute())
+        {
+            bail!("status.file must be an absolute path")
+        }
+        if self.status.interval_secs == 0 {
+            bail!("status.interval_secs must be non-zero")
         }
         if self.xdp.ipv4_max_entries == 0
             || self.xdp.ipv6_max_entries == 0
@@ -658,6 +693,7 @@ ingress_zones = ["WAN"]
             allow_flowtable_bypass: None,
             populate_batch_elements: None,
             metrics_listen: Vec::new(),
+            status_file: None,
             check: false,
             cleanup: None,
         };

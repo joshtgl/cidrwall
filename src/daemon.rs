@@ -11,6 +11,7 @@ use crate::{
         apply_stats,
     },
     rules::{RenderedRule, render},
+    status,
 };
 use anyhow::{Context, Result, bail};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -90,6 +91,15 @@ impl<B: Backend> Daemon<B> {
         for direction in [Direction::Inbound, Direction::Outbound] {
             if config.uses_nftables(direction) {
                 metrics.configure(Engine::Nftables, direction);
+                metrics.set_nft_interfaces(
+                    direction,
+                    rules
+                        .iter()
+                        .filter(|rule| rule.direction == direction)
+                        .flat_map(|rule| rule.ingress.iter().chain(rule.egress.iter()))
+                        .cloned()
+                        .collect(),
+                );
             }
         }
         #[cfg(feature = "xdp")]
@@ -125,6 +135,7 @@ impl<B: Backend> Daemon<B> {
 
     pub fn start(mut self) -> Result<()> {
         metrics::spawn(&self.config.metrics.listen, &self.config, &self.metrics)?;
+        status::spawn(&self.config, &self.metrics)?;
         let result = self.initial_load().and_then(|()| self.watch());
         let mut cleanup_errors = Vec::new();
         #[cfg(feature = "xdp")]
@@ -779,6 +790,7 @@ mod tests {
             tc: Tc::default(),
             runtime: Runtime::default(),
             metrics: Default::default(),
+            status: Default::default(),
             rules: Rules {
                 input: vec![RuleMapping {
                     blocklist: Direction::Inbound,

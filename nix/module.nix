@@ -12,6 +12,7 @@ let
   usesBpf = (cfg.settings.xdp.rules or [ ]) != [ ] || (cfg.settings.tc.rules or [ ]) != [ ];
   # `listen` is one address or a list of them.
   metricsListen = lib.toList (cfg.settings.metrics.listen or [ ]);
+  statusFile = cfg.settings.status.file or null;
 in
 {
   options.services.cidrwall = {
@@ -84,7 +85,16 @@ in
           "CAP_SYS_ADMIN"
         ];
         # Pinned links and maps live on the host bpffs and must survive restarts.
-        ReadWritePaths = lib.optional usesBpf "/sys/fs/bpf";
+        ReadWritePaths =
+          lib.optional usesBpf "/sys/fs/bpf"
+          ++ lib.optional (statusFile != null && !lib.hasPrefix "/run/cidrwall/" statusFile) (
+            dirOf statusFile
+          );
+        # The status file's default home, readable by everyone (it holds no secrets).
+        RuntimeDirectory = lib.mkIf (
+          statusFile != null && lib.hasPrefix "/run/cidrwall/" statusFile
+        ) "cidrwall";
+        RuntimeDirectoryMode = "0755";
         ReadOnlyPaths = cfg.readPaths;
         LimitMEMLOCK = "infinity";
 

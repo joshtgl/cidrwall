@@ -6,7 +6,7 @@
 use crate::config::{Config, Direction};
 use anyhow::{Context, Result};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     io::{self, BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
@@ -40,7 +40,7 @@ pub enum Engine {
 }
 
 impl Engine {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Nftables => "nftables",
             Self::Xdp => "xdp",
@@ -50,21 +50,23 @@ impl Engine {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ApplyState {
-    active_slot: Option<u32>,
-    ipv4_entries: u64,
-    ipv6_entries: u64,
-    source_cidrs: u64,
-    last_success_unix: Option<u64>,
-    failures: u64,
-    last_ok: bool,
+pub(crate) struct ApplyState {
+    pub(crate) active_slot: Option<u32>,
+    pub(crate) ipv4_entries: u64,
+    pub(crate) ipv6_entries: u64,
+    pub(crate) source_cidrs: u64,
+    pub(crate) last_success_unix: Option<u64>,
+    pub(crate) failures: u64,
+    pub(crate) last_ok: bool,
 }
 
 #[derive(Debug, Clone, Default)]
-struct State {
-    applies: BTreeMap<(Engine, Direction), ApplyState>,
-    interfaces: BTreeMap<Engine, BTreeMap<u32, String>>,
-    reconcile_failures: u64,
+pub(crate) struct State {
+    pub(crate) applies: BTreeMap<(Engine, Direction), ApplyState>,
+    pub(crate) interfaces: BTreeMap<Engine, BTreeMap<u32, String>>,
+    /// Interfaces the nftables rules match, which have no per-interface counters.
+    pub(crate) nft_interfaces: BTreeMap<Direction, BTreeSet<String>>,
+    pub(crate) reconcile_failures: u64,
     scrape_errors: BTreeMap<Engine, u64>,
 }
 
@@ -115,18 +117,30 @@ impl Metrics {
     pub fn set_interfaces(&self, engine: Engine, interfaces: BTreeMap<u32, String>) {
         self.lock().interfaces.insert(engine, interfaces);
     }
+
+    pub fn set_nft_interfaces(&self, direction: Direction, interfaces: BTreeSet<String>) {
+        self.lock().nft_interfaces.insert(direction, interfaces);
+    }
 }
 
 /// Packet and byte totals for one label set.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PacketSample {
-    engine: Engine,
-    direction: Direction,
-    interface: String,
-    family: &'static str,
-    verdict: &'static str,
-    packets: u64,
-    bytes: u64,
+pub(crate) struct PacketSample {
+    pub(crate) engine: Engine,
+    pub(crate) direction: Direction,
+    pub(crate) interface: String,
+    pub(crate) family: &'static str,
+    pub(crate) verdict: &'static str,
+    pub(crate) packets: u64,
+    pub(crate) bytes: u64,
+}
+
+/// The daemon's recorded state with the kernel counters read alongside it.
+pub(crate) struct Sample {
+    pub(crate) state: State,
+    pub(crate) packets: Vec<PacketSample>,
+    /// Engines whose counters could not be read this time.
+    pub(crate) failed: Vec<Engine>,
 }
 
 /// Bind the listener and serve scrapes on a background thread.
@@ -296,6 +310,12 @@ fn serve(stream: TcpStream, config: &Config, metrics: &Metrics) -> io::Result<()
 
 /// Read kernel counters, then render them with the daemon's recorded state.
 fn collect(config: &Config, metrics: &Metrics) -> String {
+    let sample = sample(config, metrics);
+    render(&sample.state, &sample.packets)
+}
+
+/// Read kernel counters and take a copy of the daemon's recorded state.
+pub(crate) fn sample(config: &Config, metrics: &Metrics) -> Sample {
     #[cfg(any(feature = "xdp", feature = "tc"))]
     let interfaces = metrics.lock().interfaces.clone();
     let mut samples = Vec::new();
@@ -352,12 +372,16 @@ fn collect(config: &Config, metrics: &Metrics) -> String {
     }
     let state = {
         let mut state = metrics.lock();
-        for engine in failed {
-            *state.scrape_errors.entry(engine).or_default() += 1;
+        for engine in &failed {
+            *state.scrape_errors.entry(*engine).or_default() += 1;
         }
         state.clone()
     };
-    render(&state, &samples)
+    Sample {
+        state,
+        packets: samples,
+        failed,
+    }
 }
 
 #[cfg(any(feature = "xdp", feature = "tc"))]
@@ -584,7 +608,13 @@ fn escape(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
-fn unix_now() -> u64 {
+/// A copy of the recorded state, without reading counters.
+#[cfg(test)]
+pub(crate) fn state(metrics: &Metrics) -> State {
+    metrics.lock().clone()
+}
+
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
